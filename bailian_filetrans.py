@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
-from dashscope import Files, Transcription
+from dashscope import Files
+from dashscope.audio.qwen_asr.qwen_transcription import QwenTranscription
 
 from config import settings
 
@@ -46,6 +47,20 @@ def _uploaded_file_id(response: object) -> str:
         if output.get(key):
             return str(output[key])
     raise RuntimeError("百炼上传响应中没有文件 ID。")
+
+
+def _temporary_file_url(file_id: str) -> str:
+    response = Files.get(
+        file_id=file_id,
+        api_key=settings.dashscope_api_key,
+        workspace=settings.dashscope_workspace or None,
+    )
+    if getattr(response, "status_code", 0) != 200:
+        raise RuntimeError(f"百炼临时文件查询失败：{getattr(response, 'message', 'unknown')}")
+    output = _as_data(getattr(response, "output", {}))
+    if isinstance(output, Mapping) and isinstance(output.get("url"), str):
+        return output["url"]
+    raise RuntimeError("百炼未返回临时音频访问地址。")
 
 
 def _collect_text(value: object, result_urls: list[str]) -> list[str]:
@@ -118,11 +133,11 @@ def transcribe(path: Path) -> FileTranscription:
     if getattr(uploaded, "status_code", 0) != 200:
         raise RuntimeError(f"百炼文件上传失败：{getattr(uploaded, 'message', 'unknown')}")
     file_id = _uploaded_file_id(uploaded)
-    file_url = file_id if file_id.startswith("file://") else f"file://{file_id}"
     try:
-        submitted = Transcription.async_call(
+        file_url = _temporary_file_url(file_id)
+        submitted = QwenTranscription.async_call(
             model=settings.dashscope_asr_model,
-            file_urls=[file_url],
+            file_url=file_url,
             api_key=settings.dashscope_api_key,
             workspace=settings.dashscope_workspace or None,
             diarization_enabled=settings.dashscope_enable_diarization,
@@ -130,7 +145,7 @@ def transcribe(path: Path) -> FileTranscription:
         )
         if getattr(submitted, "status_code", 0) != 200:
             raise RuntimeError(f"百炼转写任务提交失败：{getattr(submitted, 'message', 'unknown')}")
-        completed = Transcription.wait(
+        completed = QwenTranscription.wait(
             submitted,
             api_key=settings.dashscope_api_key,
             workspace=settings.dashscope_workspace or None,
@@ -138,6 +153,12 @@ def transcribe(path: Path) -> FileTranscription:
         )
         if getattr(completed, "status_code", 0) != 200:
             raise RuntimeError(f"百炼转写任务失败：{getattr(completed, 'message', 'unknown')}")
+        completed_output = _as_data(getattr(completed, "output", {}))
+        task_status = ""
+        if isinstance(completed_output, Mapping):
+            task_status = str(completed_output.get("task_status", "")).upper()
+        if task_status not in {"SUCCESS", "SUCCEEDED"}:
+            raise RuntimeError(f"百炼转写任务未成功完成：{task_status or 'UNKNOWN'}")
         return _response_transcript(completed)
     finally:
         if settings.dashscope_delete_uploaded_file:
