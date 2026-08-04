@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+data/
+runtime/
+.env
+AccessKey.csv
+deepseekkey.txt
+dashscopekey.txt
+bailiankey.txt
+*key*.txt
+*apiKey*.csv
