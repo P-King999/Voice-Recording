@@ -25,13 +25,17 @@ function Start-ManagedProcess {
     param([string]$Name, [string]$ExpectedArgument, [string[]]$Arguments)
 
     if (Test-ManagedProcess -Name $Name -ExpectedArgument $ExpectedArgument) { return }
-    $OutputLog = Join-Path $RuntimeDir "${Name}.log"
-    $ErrorLog = Join-Path $RuntimeDir "${Name}.error.log"
-    $Process = Start-Process -FilePath $Pythonw -ArgumentList $Arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden -RedirectStandardOutput $OutputLog -RedirectStandardError $ErrorLog -PassThru
+    $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $StartInfo.FileName = $Pythonw
+    $StartInfo.Arguments = [string]::Join(" ", $Arguments)
+    $StartInfo.WorkingDirectory = $ProjectRoot
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $Process = [System.Diagnostics.Process]::Start($StartInfo)
     Set-Content -LiteralPath (Join-Path $RuntimeDir "${Name}.pid") -Value $Process.Id -NoNewline
 }
 
 Start-ManagedProcess -Name "recorder" -ExpectedArgument "recorder.py" -Arguments @("recorder.py")
 Start-ManagedProcess -Name "worker" -ExpectedArgument "worker.py" -Arguments @("worker.py")
 Start-ManagedProcess -Name "keep_awake" -ExpectedArgument "keep_awake.py" -Arguments @("keep_awake.py")
-Start-ManagedProcess -Name "dashboard" -ExpectedArgument "streamlit" -Arguments @("-m", "streamlit", "run", "dashboard.py", "--server.headless=true", "--server.port=8501", "--browser.gatherUsageStats=false")
+Start-ManagedProcess -Name "dashboard" -ExpectedArgument "streamlit" -Arguments @("-m", "streamlit", "run", "dashboard.py", "--server.headless=true", "--server.address=0.0.0.0", "--server.port=8501", "--browser.gatherUsageStats=false")

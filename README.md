@@ -57,6 +57,18 @@ Copy-Item .env.example .env
 
 打开浏览器访问 `http://localhost:8501`，或双击 `Open-Dashboard.cmd`。页面只负责展示，关闭浏览器不会停止录音。
 
+### 4.1 在手机上查看（局域网）
+
+首次开启局域网访问时，以管理员身份打开 PowerShell 并在项目目录执行：
+
+```powershell
+.\Enable-DashboardLAN.ps1
+```
+
+确保手机和这台电脑连接到同一个 Wi-Fi，然后在手机浏览器输入电脑的 WLAN IPv4 地址和端口，例如 `http://10.105.45.63:8501`。可用 `ipconfig` 查看当前 WLAN 的 IPv4 地址；它在网络变化后可能改变。
+
+该防火墙规则只允许专用（Private）网络访问 TCP `8501`。如果当前 Wi-Fi 被 Windows 标记为公用网络，请先在 Windows 网络设置中将该 Wi-Fi 改为专用网络。
+
 ### 5. 开机后自动启动（可选）
 
 以普通用户身份在 PowerShell 执行：
