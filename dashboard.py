@@ -92,17 +92,57 @@ def speaker_display_names(analysis: dict[str, object] | None) -> dict[str, str]:
 
 
 def record_display_title(record: object) -> str:
+    recorded_at = record_recorded_at(record)
+    timestamp = recorded_at.strftime("%Y-%m-%d %H:%M")
     analysis = parse_conversation_analysis(record_value(record, "conversation_analysis"))
     if analysis is None:
-        return datetime.fromisoformat(record["recorded_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+        return timestamp
     title = text_value(analysis.get("title"), "")
     if title:
-        return title
+        return f"{title}  |  {timestamp}"
     for topic in object_list(analysis.get("topics")):
         title = text_value(topic.get("title"), "")
         if title:
-            return title
-    return "空"
+            return f"{title}  |  {timestamp}"
+    return f"空  |  {timestamp}"
+
+
+def record_recorded_at(record: object) -> datetime:
+    return datetime.fromisoformat(record["recorded_at"]).astimezone()
+
+
+def archive_groups(records: list[object], now: datetime) -> list[tuple[str, str, list[object]]]:
+    """Arrange newest records into the day, week, and month archive hierarchy."""
+    today = now.date()
+    week_start = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    buckets: dict[tuple[str, str], list[object]] = {}
+
+    for record in records:
+        recorded_at = record_recorded_at(record)
+        recorded_date = recorded_at.date()
+        if recorded_date == today:
+            key = ("本日", "上午" if recorded_at.hour < 12 else "下午")
+        elif recorded_date >= week_start:
+            key = ("本周", recorded_at.strftime("%m月%d日"))
+        elif recorded_date >= month_start:
+            key = ("本月", recorded_at.strftime("%m月%d日"))
+        else:
+            key = (recorded_at.strftime("%Y年%m月"), recorded_at.strftime("%m月%d日"))
+        buckets.setdefault(key, []).append(record)
+
+    return [(heading, subheading, items) for (heading, subheading), items in buckets.items()]
+
+
+def render_archive_groups(records: list[object], now: datetime, render_record: object) -> None:
+    previous_heading = ""
+    for heading, subheading, items in archive_groups(records, now):
+        if heading != previous_heading:
+            st.markdown(f"#### {heading}")
+            previous_heading = heading
+        st.caption(subheading)
+        for record in items:
+            render_record(record)
 
 
 def render_transcript(record: object, speaker_names: dict[str, str]) -> None:
@@ -229,15 +269,18 @@ def render_conversation_analysis(record: object) -> None:
 
 def period_details(choice: str, now: datetime) -> tuple[str, datetime, datetime, str]:
     midnight = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
-    if choice == "今天上午":
-        return "morning", midnight, min(now, midnight + timedelta(hours=12)), "今天上午"
+    noon = midnight + timedelta(hours=12)
+    if choice == "本日上午":
+        return "morning", midnight, min(now, noon), "本日上午"
+    if choice == "本日下午":
+        return "afternoon", noon, max(now, noon), "本日下午"
     if choice == "本周":
         start = midnight - timedelta(days=now.weekday())
         return "week", start, now, f"本周（{start:%m-%d} 至今）"
     if choice == "本月":
         start = midnight.replace(day=1)
         return "month", start, now, f"本月（{start:%Y-%m}）"
-    return "day", midnight, now, "今天"
+    return "day", midnight, now, "本日"
 
 
 st.set_page_config(page_title="录音档案", page_icon="R", layout="wide")
@@ -275,7 +318,7 @@ st.title("录音档案")
 st.caption("固定时长录音、百炼文件转写，以及按时段清晰整理")
 
 now = datetime.now().astimezone()
-choice = st.segmented_control("分析范围", ["今天", "今天上午", "本周", "本月"], default="今天")
+choice = st.segmented_control("分析范围", ["本日", "本日上午", "本日下午", "本周", "本月"], default="本日")
 selected_mode = st.selectbox(
     "分析模型",
     list(SUMMARY_MODE_LABELS),
@@ -284,7 +327,7 @@ selected_mode = st.selectbox(
     else 0,
     format_func=lambda value: SUMMARY_MODE_LABELS[value],
 )
-period_type, period_start, period_end, period_label = period_details(choice or "今天", now)
+period_type, period_start, period_end, period_label = period_details(choice or "本日", now)
 summary = get_period_summary(period_type, period_start)
 transcript, source_count = period_transcript(period_start, period_end)
 
@@ -334,13 +377,15 @@ with analysis_tab:
     analyzed_records = [record for record in filtered if record["transcript"]]
     if not analyzed_records:
         st.caption("当前筛选范围内还没有完成转写的录音。")
-    for record in analyzed_records:
+    def render_analysis_record(record: object) -> None:
         duration = f"{record['duration_seconds'] / 60:.1f} 分钟"
         with st.expander(f"{record_display_title(record)}  |  {duration}"):
             render_conversation_analysis(record)
 
+    render_archive_groups(analyzed_records, now, render_analysis_record)
+
 with transcript_tab:
-    for record in filtered:
+    def render_transcript_record(record: object) -> None:
         duration = f"{record['duration_seconds'] / 60:.1f} 分钟"
         status = STATUS_LABELS.get(record["status"], record["status"])
         with st.expander(f"{record_display_title(record)}  |  {duration}  |  {status}"):
@@ -367,3 +412,5 @@ with transcript_tab:
                     )
                 if record["error"]:
                     st.error(record["error"])
+
+    render_archive_groups(filtered, now, render_transcript_record)
