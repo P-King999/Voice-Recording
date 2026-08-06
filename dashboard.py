@@ -91,6 +91,20 @@ def speaker_display_names(analysis: dict[str, object] | None) -> dict[str, str]:
     return names
 
 
+def record_display_title(record: object) -> str:
+    analysis = parse_conversation_analysis(record_value(record, "conversation_analysis"))
+    if analysis is None:
+        return datetime.fromisoformat(record["recorded_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+    title = text_value(analysis.get("title"), "")
+    if title:
+        return title
+    for topic in object_list(analysis.get("topics")):
+        title = text_value(topic.get("title"), "")
+        if title:
+            return title
+    return "空"
+
+
 def render_transcript(record: object, speaker_names: dict[str, str]) -> None:
     timeline = transcript_timeline(record["transcript_timeline"])
     if not timeline:
@@ -321,17 +335,15 @@ with analysis_tab:
     if not analyzed_records:
         st.caption("当前筛选范围内还没有完成转写的录音。")
     for record in analyzed_records:
-        label_time = datetime.fromisoformat(record["recorded_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
         duration = f"{record['duration_seconds'] / 60:.1f} 分钟"
-        with st.expander(f"{label_time}  |  {duration}"):
+        with st.expander(f"{record_display_title(record)}  |  {duration}"):
             render_conversation_analysis(record)
 
 with transcript_tab:
     for record in filtered:
-        label_time = datetime.fromisoformat(record["recorded_at"]).astimezone().strftime("%Y-%m-%d %H:%M")
         duration = f"{record['duration_seconds'] / 60:.1f} 分钟"
         status = STATUS_LABELS.get(record["status"], record["status"])
-        with st.expander(f"{label_time}  |  {duration}  |  {status}"):
+        with st.expander(f"{record_display_title(record)}  |  {duration}  |  {status}"):
             left, right = st.columns([1, 2])
             with left:
                 audio_path = Path(record["path"])
