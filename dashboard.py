@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, time, timedelta
+from html import escape
 from pathlib import Path
 
 import streamlit as st
@@ -26,6 +29,76 @@ SUMMARY_MODE_LABELS = {
 }
 
 
+def format_offset(seconds: float) -> str:
+    total_seconds = max(0, round(seconds))
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def split_transcript(transcript: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", transcript).strip()
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[。！？!?；;])\s*", normalized) if sentence.strip()]
+    readable: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= 64:
+            readable.append(sentence)
+            continue
+        readable.extend(part.strip() for part in re.findall(r".{1,64}(?:[，,、]|$)", sentence) if part.strip())
+    return readable or [normalized]
+
+
+def transcript_timeline(raw_timeline: str | None) -> list[dict[str, object]]:
+    if not raw_timeline:
+        return []
+    try:
+        items = json.loads(raw_timeline)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    timeline: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        try:
+            start_seconds = float(item["start_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start_seconds < 0 or not item["text"].strip():
+            continue
+        timeline.append({**item, "start_seconds": start_seconds, "text": item["text"].strip()})
+    return sorted(timeline, key=lambda item: float(item["start_seconds"]))
+
+
+def render_transcript(record: object) -> None:
+    timeline = transcript_timeline(record["transcript_timeline"])
+    if not timeline:
+        st.caption("逐字稿已按句子整理；该历史转写没有时间戳，无法精确跳转。")
+        for sentence in split_transcript(record["transcript"]):
+            st.markdown(f'<div class="transcript-line">{escape(sentence)}</div>', unsafe_allow_html=True)
+        return
+
+    st.caption("点击播放图标，即可从该句开始收听。")
+    for index, sentence in enumerate(timeline):
+        start_seconds = float(sentence["start_seconds"])
+        controls, content = st.columns([1, 14], vertical_alignment="center")
+        with controls:
+            if st.button("▶", key=f"play-{record['id']}-{index}", help=f"从 {format_offset(start_seconds)} 开始播放"):
+                st.session_state["pending_playback"] = {
+                    "record_id": record["id"],
+                    "start_seconds": start_seconds,
+                }
+                st.rerun()
+        with content:
+            speaker = sentence.get("speaker")
+            speaker_label = f"<span class=\"speaker-label\">说话人 {escape(str(speaker))}</span>" if speaker else ""
+            st.markdown(
+                f'<div class="transcript-line"><span class="timestamp">{format_offset(start_seconds)}</span>'
+                f"{speaker_label}{escape(str(sentence['text']))}</div>",
+                unsafe_allow_html=True,
+            )
+
+
 def period_details(choice: str, now: datetime) -> tuple[str, datetime, datetime, str]:
     midnight = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
     if choice == "今天上午":
@@ -42,6 +115,33 @@ def period_details(choice: str, now: datetime) -> tuple[str, datetime, datetime,
 st.set_page_config(page_title="录音档案", page_icon="R", layout="wide")
 ensure_storage()
 init_db()
+
+st.markdown(
+    """
+    <style>
+    .transcript-line {
+        border-left: 3px solid #cbd5e1;
+        line-height: 1.7;
+        margin: 0.25rem 0;
+        padding: 0.35rem 0.65rem;
+    }
+    .timestamp {
+        color: #64748b;
+        display: inline-block;
+        font-family: monospace;
+        margin-right: 0.65rem;
+        min-width: 3.5rem;
+    }
+    .speaker-label {
+        color: #0f766e;
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin-right: 0.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("录音档案")
 st.caption("固定时长录音、百炼文件转写，以及按时段清晰整理")
@@ -109,19 +209,22 @@ for record in filtered:
             audio_path = Path(record["path"])
             if audio_path.exists():
                 audio_format = "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav"
-                st.audio(str(audio_path), format=audio_format)
+                playback = st.session_state.get("pending_playback")
+                should_autoplay = bool(playback and playback["record_id"] == record["id"])
+                start_seconds = float(playback["start_seconds"]) if should_autoplay else 0.0
+                if should_autoplay:
+                    del st.session_state["pending_playback"]
+                st.audio(str(audio_path), format=audio_format, start_time=start_seconds, autoplay=should_autoplay)
             st.caption(f"响度：{record['dbfs']:.1f} dBFS" if record["dbfs"] is not None else "等待音频分析")
             if record["active_seconds"] is not None:
                 st.caption(f"活动声音：{record['active_seconds']:.1f} 秒")
         with right:
             if record["transcript"]:
                 st.markdown("#### 逐字稿")
-                st.write(record["transcript"])
+                render_transcript(record)
             if record["speech_analysis"]:
                 st.markdown("#### 阿里云语音分析")
                 try:
-                    import json
-
                     st.json(json.loads(record["speech_analysis"]))
                 except (TypeError, ValueError):
                     st.write(record["speech_analysis"])

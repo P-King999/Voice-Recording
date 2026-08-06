@@ -33,6 +33,7 @@ def init_db() -> None:
                 active_seconds REAL,
                 status TEXT NOT NULL DEFAULT 'queued',
                 transcript TEXT,
+                transcript_timeline TEXT,
                 speech_analysis TEXT,
                 summary TEXT,
                 error TEXT,
@@ -45,6 +46,8 @@ def init_db() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(segments)").fetchall()}
         if "speech_analysis" not in columns:
             conn.execute("ALTER TABLE segments ADD COLUMN speech_analysis TEXT")
+        if "transcript_timeline" not in columns:
+            conn.execute("ALTER TABLE segments ADD COLUMN transcript_timeline TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS period_summaries (

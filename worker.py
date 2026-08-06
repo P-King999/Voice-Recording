@@ -175,7 +175,15 @@ def process(path: Path) -> None:
     update_segment(mp3_path, status="transcribing", error=None)
     result = bailian_transcribe(mp3_path)
     analysis = json.dumps(result.speech_analysis, ensure_ascii=False) if result.speech_analysis else None
-    update_segment(mp3_path, status="complete", transcript=result.transcript, speech_analysis=analysis, error=None)
+    timeline = json.dumps(result.timeline, ensure_ascii=False) if result.timeline else None
+    update_segment(
+        mp3_path,
+        status="complete",
+        transcript=result.transcript,
+        transcript_timeline=timeline,
+        speech_analysis=analysis,
+        error=None,
+    )
     logging.info("Transcribed %s", mp3_path.name)
 
 

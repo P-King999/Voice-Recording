@@ -15,6 +15,7 @@ from config import settings
 @dataclass(frozen=True)
 class FileTranscription:
     transcript: str
+    timeline: list[dict[str, object]]
     speech_analysis: dict[str, object]
 
 
@@ -101,6 +102,68 @@ def _collect_speech_analysis(value: object) -> dict[str, object]:
     return collected
 
 
+def _timestamp_seconds(value: object, key: str) -> float | None:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp < 0:
+        return None
+    return timestamp if "second" in key else timestamp / 1000
+
+
+def _sentence_entry(value: object) -> dict[str, object] | None:
+    value = _as_data(value)
+    if not isinstance(value, Mapping):
+        return None
+    text = next(
+        (str(value[key]).strip() for key in ("text", "transcript", "content") if isinstance(value.get(key), str)),
+        "",
+    )
+    start_key = next((key for key in ("begin_time", "begin_time_ms", "start_time", "start_time_ms") if key in value), None)
+    if not text or start_key is None:
+        return None
+    start_seconds = _timestamp_seconds(value[start_key], start_key)
+    if start_seconds is None:
+        return None
+    end_key = next((key for key in ("end_time", "end_time_ms", "stop_time", "stop_time_ms") if key in value), None)
+    end_seconds = _timestamp_seconds(value[end_key], end_key) if end_key is not None else None
+    sentence: dict[str, object] = {"text": text, "start_seconds": start_seconds}
+    if end_seconds is not None and end_seconds >= start_seconds:
+        sentence["end_seconds"] = end_seconds
+    speaker = next((value[key] for key in ("speaker", "speaker_id", "speaker_name") if value.get(key) is not None), None)
+    if speaker is not None:
+        sentence["speaker"] = str(speaker)
+    return sentence
+
+
+def _collect_sentence_timeline(value: object) -> list[dict[str, object]]:
+    value = _as_data(value)
+    if isinstance(value, Mapping):
+        timeline: list[dict[str, object]] = []
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if normalized in {"sentences", "sentence", "utterances", "utterance"}:
+                candidates = item if isinstance(item, list) else [item]
+                for candidate in candidates:
+                    sentence = _sentence_entry(candidate)
+                    if sentence:
+                        timeline.append(sentence)
+            timeline.extend(_collect_sentence_timeline(item))
+        return timeline
+    if isinstance(value, list):
+        return [sentence for item in value for sentence in _collect_sentence_timeline(item)]
+    return []
+
+
+def _timeline_from_sources(sources: list[object]) -> list[dict[str, object]]:
+    unique: dict[tuple[float, str], dict[str, object]] = {}
+    for source in sources:
+        for sentence in _collect_sentence_timeline(source):
+            unique[(float(sentence["start_seconds"]), str(sentence["text"]))] = sentence
+    return sorted(unique.values(), key=lambda sentence: float(sentence["start_seconds"]))
+
+
 def _response_transcript(response: object) -> FileTranscription:
     result_urls: list[str] = []
     sources: list[object] = [getattr(response, "output", {})]
@@ -117,7 +180,11 @@ def _response_transcript(response: object) -> FileTranscription:
     analysis: dict[str, object] = {}
     for source in sources:
         analysis.update(_collect_speech_analysis(source))
-    return FileTranscription("\n".join(dict.fromkeys(text for text in texts if text)), analysis)
+    return FileTranscription(
+        "\n".join(dict.fromkeys(text for text in texts if text)),
+        _timeline_from_sources(sources),
+        analysis,
+    )
 
 
 def transcribe(path: Path) -> FileTranscription:
