@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -20,8 +22,21 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def transaction() -> Iterator[sqlite3.Connection]:
+    conn = connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db() -> None:
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS segments (
@@ -34,7 +49,8 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'queued',
                 transcript TEXT,
                 transcript_timeline TEXT,
-                speech_analysis TEXT,
+                conversation_analysis TEXT,
+                conversation_analysis_error TEXT,
                 summary TEXT,
                 error TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -44,10 +60,12 @@ def init_db() -> None:
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(segments)").fetchall()}
-        if "speech_analysis" not in columns:
-            conn.execute("ALTER TABLE segments ADD COLUMN speech_analysis TEXT")
         if "transcript_timeline" not in columns:
             conn.execute("ALTER TABLE segments ADD COLUMN transcript_timeline TEXT")
+        if "conversation_analysis" not in columns:
+            conn.execute("ALTER TABLE segments ADD COLUMN conversation_analysis TEXT")
+        if "conversation_analysis_error" not in columns:
+            conn.execute("ALTER TABLE segments ADD COLUMN conversation_analysis_error TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS period_summaries (
@@ -75,7 +93,7 @@ def init_db() -> None:
 
 def add_segment(path: Path, recorded_at: datetime, duration_seconds: float, status: str = "queued") -> None:
     timestamp = now()
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO segments
                (path, recorded_at, duration_seconds, status, created_at, updated_at)
@@ -89,17 +107,17 @@ def update_segment(source_path: Path, **fields: object) -> None:
         return
     fields["updated_at"] = now()
     assignments = ", ".join(f"{key} = ?" for key in fields)
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute(f"UPDATE segments SET {assignments} WHERE path = ?", [*fields.values(), str(source_path)])
 
 
 def queued_segments(limit: int = 20) -> list[sqlite3.Row]:
-    with connect() as conn:
+    with transaction() as conn:
         return conn.execute("SELECT * FROM segments WHERE status = 'queued' ORDER BY recorded_at LIMIT ?", (limit,)).fetchall()
 
 
 def requeue_dashscope_waiting_segments() -> None:
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute(
             "UPDATE segments SET status = 'queued', error = NULL, updated_at = ? WHERE status = 'awaiting_dashscope_config'",
             (now(),),
@@ -107,12 +125,12 @@ def requeue_dashscope_waiting_segments() -> None:
 
 
 def remove_incomplete_segment_records() -> None:
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute("DELETE FROM segments WHERE path LIKE ?", ("%.part.wav",))
 
 
 def dashboard_segments(limit: int = 500) -> list[sqlite3.Row]:
-    with connect() as conn:
+    with transaction() as conn:
         return conn.execute("SELECT * FROM segments ORDER BY recorded_at DESC LIMIT ?", (limit,)).fetchall()
 
 
@@ -129,12 +147,12 @@ def daily_transcript(day: date) -> tuple[str, int]:
 
 
 def get_daily_summary(day: date) -> sqlite3.Row | None:
-    with connect() as conn:
+    with transaction() as conn:
         return conn.execute("SELECT * FROM daily_summaries WHERE day = ?", (day.isoformat(),)).fetchone()
 
 
 def save_daily_summary(day: date, summary: str, source_segment_count: int) -> None:
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute(
             """INSERT INTO daily_summaries (day, summary, source_segment_count, generated_at)
                VALUES (?, ?, ?, ?)
@@ -159,7 +177,7 @@ def period_transcript(start: datetime, end: datetime) -> tuple[str, int]:
 
 
 def get_period_summary(period_type: str, period_start: datetime) -> sqlite3.Row | None:
-    with connect() as conn:
+    with transaction() as conn:
         return conn.execute(
             "SELECT * FROM period_summaries WHERE period_type = ? AND period_start = ?",
             (period_type, period_start.isoformat()),
@@ -169,7 +187,7 @@ def get_period_summary(period_type: str, period_start: datetime) -> sqlite3.Row 
 def save_period_summary(
     period_type: str, period_start: datetime, summary: str, provider: str, source_segment_count: int
 ) -> None:
-    with connect() as conn:
+    with transaction() as conn:
         conn.execute(
             """INSERT INTO period_summaries
                (period_type, period_start, summary, provider, source_segment_count, generated_at)

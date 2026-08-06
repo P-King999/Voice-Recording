@@ -54,6 +54,72 @@ SUMMARY_MODES = {
     "deepseek_v4_pro": ("DeepSeek-V4-Pro", "deepseek", "deepseek-v4-pro"),
     "qwen_plus": ("千问 Qwen Plus", "bailian", "qwen-plus"),
 }
+CONVERSATION_SYSTEM_PROMPT = """你是录音对话整理助手。只依据给定逐字稿整理对话主题、说话人、人物关系和事件。
+
+严格规则：
+1. 不得编造人物姓名、身份、关系、动机、感情状况、背景或未出现的事实。
+2. 优先使用录音中明确出现的姓名、称呼、职位。没有充分依据时使用“说话人 A / B / C”。
+3. 仅当上下文有明确证据时，才可使用“客户”“负责人”“同事”等角色，并在 evidence 中说明依据和 confidence。
+4. 对“听说”“好像”“有人说”等内容，必须标为“转述传闻”；不得当作事实。多人同时说话或归属不明时标为“多人/不明”。
+5. 日常闲聊优先识别值得关注的事件、关键人物、明确提到的关系和背景；只保留有原话依据的内容。
+6. 不得根据语气、说话风格或出现频率猜测真实身份、私人关系或敏感背景。
+7. 输出简洁、客观的中文 JSON，不输出 Markdown 或额外说明。"""
+CONVERSATION_USER_PROMPT = """请分析以下一段录音逐字稿。时间戳和“原始说话人”来自语音转写，仅用于整理对话轮次。
+
+严格按以下 JSON 结构输出：
+{
+  "overview": "100 字以内的整体摘要",
+  "speaker_map": [
+    {
+      "source_speaker": "原始说话人编号；没有编号则省略",
+      "display_name": "说话人 A 或有依据的角色/称呼",
+      "evidence": "命名或角色判断的录音依据；没有依据写记录不充分",
+      "confidence": "high|medium|low"
+    }
+  ],
+  "noteworthy_events": [
+    {
+      "title": "事件标题",
+      "type": "明确事实|转述传闻|信息不足",
+      "details": "具体聊了什么",
+      "people": ["相关人物"],
+      "evidence_quote": "不超过 30 字的原话",
+      "confidence": "high|medium|low",
+      "caution": "传闻或不充分信息的必要说明"
+    }
+  ],
+  "key_people": [
+    {
+      "name_or_label": "姓名或角色标签",
+      "background": "录音明确提到的背景、职责或现状",
+      "relationships": [
+        {
+          "with": "相关人物",
+          "relationship": "明确提到的关系",
+          "basis": "录音依据",
+          "confidence": "high|medium|low"
+        }
+      ]
+    }
+  ],
+  "topics": [
+    {
+      "title": "话题标题",
+      "summary": "一句话概括",
+      "participants": ["参与者"],
+      "detailed_discussion": [
+        {"point": "聊了什么", "details": "具体讨论内容"},
+        {"point": "分歧与理由", "details": "没有则写未明确出现"},
+        {"point": "最终安排", "details": "没有则写未形成明确结论"}
+      ],
+      "outcome": "结论或未形成明确结论",
+      "action_items": ["明确的待办；没有则为空数组"]
+    }
+  ]
+}
+
+逐字稿如下：
+"""
 
 
 def audio_activity(path: Path) -> tuple[float, float]:
@@ -127,6 +193,60 @@ def summarize_with_deepseek(transcript: str, period_label: str, model: str) -> s
     return response.json()["choices"][0]["message"]["content"]
 
 
+def conversation_source(transcript: str, raw_timeline: str | None) -> str:
+    if not raw_timeline:
+        return transcript
+    try:
+        timeline = json.loads(raw_timeline)
+    except (TypeError, ValueError):
+        return transcript
+    if not isinstance(timeline, list):
+        return transcript
+    lines: list[str] = []
+    for item in timeline:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        try:
+            seconds = max(0, round(float(item["start_seconds"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        minutes, seconds = divmod(seconds, 60)
+        speaker = f"原始说话人 {item['speaker']}" if item.get("speaker") is not None else "原始说话人不明"
+        lines.append(f"[{minutes:02d}:{seconds:02d}] {speaker}：{item['text'].strip()}")
+    return "\n".join(lines) or transcript
+
+
+def _json_object(content: str) -> dict[str, object]:
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1] if "\n" in content else ""
+        content = content.rsplit("```", 1)[0].strip()
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("DeepSeek 未返回对象格式的对话分析。")
+    return result
+
+
+def analyze_transcript_conversation(transcript: str, raw_timeline: str | None) -> dict[str, object]:
+    if not settings.llm_key:
+        raise RuntimeError("未配置 DeepSeek API Key。")
+    response = requests.post(
+        settings.llm_url,
+        headers={"Authorization": f"Bearer {settings.llm_key}", "Content-Type": "application/json"},
+        json={
+            "model": settings.llm_model,
+            "messages": [
+                {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
+                {"role": "user", "content": CONVERSATION_USER_PROMPT + conversation_source(transcript, raw_timeline)},
+            ],
+            "temperature": 0.2,
+        },
+        timeout=600,
+    )
+    response.raise_for_status()
+    return _json_object(response.json()["choices"][0]["message"]["content"])
+
+
 def summarize(transcript: str, period_label: str, selected_mode: str | None = None) -> tuple[str, str]:
     mode = selected_mode or settings.default_summary_mode
     fallback_order = [mode, "deepseek_v4_pro", "qwen_plus"]
@@ -174,14 +294,24 @@ def process(path: Path) -> None:
     mp3_path = convert_to_mp3(path)
     update_segment(mp3_path, status="transcribing", error=None)
     result = bailian_transcribe(mp3_path)
-    analysis = json.dumps(result.speech_analysis, ensure_ascii=False) if result.speech_analysis else None
     timeline = json.dumps(result.timeline, ensure_ascii=False) if result.timeline else None
+    conversation_analysis = None
+    conversation_analysis_error = None
+    if settings.llm_key:
+        try:
+            conversation_analysis = json.dumps(
+                analyze_transcript_conversation(result.transcript, timeline), ensure_ascii=False
+            )
+        except Exception as exc:
+            conversation_analysis_error = str(exc)
+            logging.exception("Could not analyze transcript %s", mp3_path.name)
     update_segment(
         mp3_path,
         status="complete",
         transcript=result.transcript,
         transcript_timeline=timeline,
-        speech_analysis=analysis,
+        conversation_analysis=conversation_analysis,
+        conversation_analysis_error=conversation_analysis_error,
         error=None,
     )
     logging.info("Transcribed %s", mp3_path.name)

@@ -16,7 +16,6 @@ from config import settings
 class FileTranscription:
     transcript: str
     timeline: list[dict[str, object]]
-    speech_analysis: dict[str, object]
 
 
 def is_configured() -> bool:
@@ -80,26 +79,6 @@ def _collect_text(value: object, result_urls: list[str]) -> list[str]:
     if isinstance(value, list):
         return [text for item in value for text in _collect_text(item, result_urls)]
     return []
-
-
-def _collect_speech_analysis(value: object) -> dict[str, object]:
-    collected: dict[str, object] = {}
-    value = _as_data(value)
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            normalized = str(key).lower()
-            if any(marker in normalized for marker in ("speaker", "gender", "language", "audio_event", "event")):
-                collected[str(key)] = _as_data(item)
-            elif isinstance(item, (Mapping, list)):
-                nested = _collect_speech_analysis(item)
-                if nested:
-                    collected.update(nested)
-    elif isinstance(value, list):
-        nested_items = [_collect_speech_analysis(item) for item in value]
-        nested_items = [item for item in nested_items if item]
-        if nested_items:
-            collected["items"] = nested_items
-    return collected
 
 
 def _timestamp_seconds(value: object, key: str) -> float | None:
@@ -177,13 +156,9 @@ def _response_transcript(response: object) -> FileTranscription:
             texts.extend(_collect_text(body, []))
         except ValueError:
             texts.append(downloaded.text.strip())
-    analysis: dict[str, object] = {}
-    for source in sources:
-        analysis.update(_collect_speech_analysis(source))
     return FileTranscription(
         "\n".join(dict.fromkeys(text for text in texts if text)),
         _timeline_from_sources(sources),
-        analysis,
     )
 
 
@@ -208,7 +183,6 @@ def transcribe(path: Path) -> FileTranscription:
             api_key=settings.dashscope_api_key,
             workspace=settings.dashscope_workspace or None,
             diarization_enabled=settings.dashscope_enable_diarization,
-            audio_event_detection_enabled=settings.dashscope_enable_audio_events,
         )
         if getattr(submitted, "status_code", 0) != 200:
             raise RuntimeError(f"百炼转写任务提交失败：{getattr(submitted, 'message', 'unknown')}")

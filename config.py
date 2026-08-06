@@ -80,7 +80,6 @@ class Settings:
     dashscope_asr_model: str = os.getenv("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash-filetrans")
     dashscope_delete_uploaded_file: bool = os.getenv("DASHSCOPE_DELETE_UPLOADED_FILE", "true").lower() == "true"
     dashscope_enable_diarization: bool = os.getenv("DASHSCOPE_ENABLE_DIARIZATION", "true").lower() == "true"
-    dashscope_enable_audio_events: bool = os.getenv("DASHSCOPE_ENABLE_AUDIO_EVENTS", "true").lower() == "true"
     default_summary_mode: str = os.getenv("DEFAULT_SUMMARY_MODE", "deepseek_v4_flash").lower()
     bailian_summary_model: str = os.getenv("BAILIAN_SUMMARY_MODEL", "qwen-plus")
     llm_url: str = os.getenv("LLM_API_URL", "https://api.deepseek.com/chat/completions").rstrip("/")
