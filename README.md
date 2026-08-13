@@ -10,7 +10,11 @@ Windows 笔记本用的后台录音系统。它持续录制麦克风，每小时
 - 阿里云语音分析：请求说话人分离与声音事件检测；云端明确返回的性别、语种、事件字段会显示在页面。系统不会自行猜测。
 - 分时段总结：今天、今天上午、本周、本月。
 - 总结模型可在页面即时切换：默认 `DeepSeek-V4-Flash`，可改为 `DeepSeek-V4-Pro` 或 `千问 Qwen Plus`。默认模型不可用时，依次回退到 Pro 与千问。
-- 全部服务后台运行，带登录自启与防自动休眠。
+- 看板支持实时音量与服务状态、全文检索、按日期/状态/星级筛选、收藏、标签、备注、逐句书签、批量重试/删除，以及 Markdown、Word 和 SRT 导出。
+- 对话分析会生成标题、摘要、人物/事件、待办和 1-5 星重要程度；可重跑分析、修改说话人显示名，并查看历史汇总版本。
+- 可设置看板密码、编辑本地 `.env` 配置，并在保存后重启后台服务。
+- 定时日报支持 QQ 邮箱 SMTP、企业微信机器人和 PushPlus；可通过 QQ 邮箱向自身发信查询当前或指定日期的报告。
+- 全部服务后台运行，带登录自启、防自动休眠，以及电池供电时自动切换 Windows 节能模式。
 
 ## 从零部署
 
@@ -53,7 +57,7 @@ Copy-Item .env.example .env
 
 ### 4. 后台启动
 
-双击 `Launch-VoiceRecorder.vbs`。它不会打开命令行窗口，而是在后台启动四个服务：录音、处理、阻止自动休眠、网页面板。
+双击 `Launch-VoiceRecorder.vbs`。它不会打开命令行窗口，而是在后台启动录音、处理、阻止自动休眠、电源管理、网页面板、日报和邮件查询服务。
 
 打开浏览器访问 `http://localhost:8501`，或双击 `Open-Dashboard.cmd`。页面只负责展示，关闭浏览器不会停止录音。
 
@@ -97,6 +101,14 @@ Copy-Item .env.example .env
 
 这不会修改电池供电时的睡眠设置。
 
+## 看板使用
+
+看板分为“首页”“搜索与档案”“设置”三个页面。首页用于查看实时录音状态、服务健康度、当天录音和分时段汇总；“搜索与档案”可按关键词、日期、处理状态、星级和收藏筛选，选中多条记录后可批量重试、删除或导出。
+
+打开一条记录可播放音频、从任意一句开始播放、添加书签、编辑标签/收藏/备注，并查看或重新生成对话分析。对话分析中的重点原话会加粗显示；说话人别名会保存到本地数据库，后续记录也会沿用。导出支持 Markdown、Word 兼容格式和 SRT 字幕。
+
+“设置”中可修改录音、转写、汇总模型、看板密码、磁盘告警和日报配置。保存并重启后，后台服务会按新的 `.env` 配置启动。`.env` 和密钥文件包含敏感信息，不能提交到 GitHub。
+
 ## 如何停止
 
 要完全停止录音、转写、网页和防休眠服务，在项目根目录的 PowerShell 执行：
@@ -107,15 +119,37 @@ Copy-Item .env.example .env
 
 该命令只停止本项目启动的后台进程，不会影响其他 Python 程序。若还启用了登录自启，请另行执行 `Uninstall-AutoStart.ps1`，否则下次登录会再次启动。
 
-## Local Scheduled Reports
+## 定时日报
 
-`reporter.py` starts alongside the recorder. Set `REPORT_ENABLED=true` to generate a short report at `12:10` and `18:10` every day. The report prioritizes the current morning's recording, silent/transcription state, service health, disk capacity, and the morning content summary. If a summary has not yet been generated in the dashboard, the reporter creates one from completed transcripts before it sends.
+`reporter.py` 会随录音器启动。将 `.env` 中的 `REPORT_ENABLED` 设为 `true`，并用 `REPORT_TIMES` 配置每日发送时间，例如 `12:10,18:10`。报告包含本日上午或当日的录音、静音/转写状态、服务健康度、磁盘容量和内容摘要；若看板尚未生成对应摘要，报告会从已完成的逐字稿生成一次。
 
-By default it sends with QQ Mail SMTP to `sp.99@qq.com`. Set `REPORT_SMTP_AUTH_CODE` in `.env` to the QQ Mail SMTP authorization code, not the QQ account password. You can instead set `REPORT_CHANNELS=wecom` with an enterprise WeChat robot webhook, or `REPORT_CHANNELS=pushplus` with a PushPlus token. Personal WeChat accounts do not provide a stable official bot API, so direct personal-account delivery is not supported.
+QQ 邮箱 SMTP 需配置 `REPORT_SMTP_USERNAME`、`REPORT_SMTP_AUTH_CODE` 和收件人 `REPORT_EMAIL_RECIPIENT`。`REPORT_SMTP_AUTH_CODE` 必须是 QQ 邮箱 SMTP 授权码，不是登录密码。也可以把 `REPORT_CHANNELS` 设为 `wecom` 并配置企业微信机器人 Webhook，或设为 `pushplus` 并配置 PushPlus Token。个人微信没有稳定的官方机器人接口，不支持直接向个人微信发送。
 
-## QQ Mail Query
+## QQ 邮箱查询
 
-With QQ IMAP enabled, the local `mail_query.py` service checks the inbox once per minute. Send an email from `sp.99@qq.com` to itself with any subject or body text to receive the current report. Include a date such as `2026-08-12` or `2026年8月12日` in the subject or body to receive the historical report for that date. Only messages sent by the same configured QQ account are processed; other senders are ignored. System-generated reports are marked and ignored to prevent reply loops. The service starts from new messages only and does not reply to old inbox messages.
+启用 QQ 邮箱 IMAP 后，`mail_query.py` 会按 `REPORT_QUERY_INTERVAL_SECONDS` 定期检查收件箱。用配置的同一 QQ 邮箱给自己发一封邮件，主题或正文填写任意内容即可收到当前报告；包含 `2026-08-12` 或 `2026年8月12日` 等日期时，回复该日期的历史报告。服务只处理同一配置邮箱发来的新邮件，并会跳过系统日报，避免邮件循环。
+
+## 定时关机与电源策略
+
+`power_manager.py` 会在电池供电时切换 Windows 节能模式，接通电源后恢复原先的电源计划。该设置仅影响电源计划，不会自动关机。
+
+需要每天定时关机时，以管理员身份运行 PowerShell 后执行以下命令；默认每天 `21:00` 关机，开始关机前会倒计时 60 秒，便于当前录音片段写入完成：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Configure-ScheduledPower.ps1
+```
+
+可指定时间，例如：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Configure-ScheduledPower.ps1 -ShutdownTime 21:30
+```
+
+移除定时任务：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Remove-ScheduledPower.ps1
+```
 
 ## 数据位置
 
