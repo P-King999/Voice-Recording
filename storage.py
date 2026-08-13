@@ -223,6 +223,17 @@ def requeue_dashscope_waiting_segments() -> None:
         )
 
 
+def requeue_interrupted_segments() -> None:
+    """Resume work abandoned by a previous Windows shutdown or process exit."""
+    with transaction() as conn:
+        conn.execute(
+            """UPDATE segments
+               SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+               WHERE status = 'transcribing'""",
+            (now(),),
+        )
+
+
 def remove_incomplete_segment_records() -> None:
     with transaction() as conn:
         conn.execute("DELETE FROM segments WHERE path LIKE ?", ("%.part.wav",))

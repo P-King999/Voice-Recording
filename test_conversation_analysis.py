@@ -35,6 +35,22 @@ class ConversationAnalysisTests(unittest.TestCase):
                 storage.DB_PATH = original_db_path
                 gc.collect()
 
+    def test_startup_requeues_interrupted_transcription(self) -> None:
+        original_db_path = storage.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            storage.DB_PATH = Path(directory) / "voice_recorder.sqlite3"
+            try:
+                storage.init_db()
+                storage.add_segment(Path(directory) / "sample.wav", datetime.now(timezone.utc), 3)
+                claimed = storage.claim_segments(owner="old-worker", lease_seconds=3600)
+                storage.requeue_interrupted_segments()
+                resumed = storage.claim_segments(owner="new-worker", lease_seconds=60)
+                self.assertEqual([row["id"] for row in resumed], [claimed[0]["id"]])
+                self.assertEqual(resumed[0]["lease_owner"], "new-worker")
+            finally:
+                storage.DB_PATH = original_db_path
+                gc.collect()
+
     def test_conversation_source_keeps_time_and_original_speaker(self) -> None:
         timeline = json.dumps([
             {"start_seconds": 65.4, "speaker": "2", "text": "我们明天再确认。"},

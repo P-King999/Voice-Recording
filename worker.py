@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import signal
 import shutil
 import subprocess
 import time
@@ -24,6 +25,7 @@ from storage import (
     period_transcript,
     claim_segments,
     remove_incomplete_segment_records,
+    requeue_interrupted_segments,
     requeue_dashscope_waiting_segments,
     save_period_summary,
     save_summary_version,
@@ -32,6 +34,7 @@ from storage import (
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+STOP = False
 SUMMARY_SYSTEM_PROMPT = """你是一位客观、克制、善于梳理办公室日常对话的记录员。
 只依据给定逐字稿陈述事实；不得猜测动机、关系、身份或未被明确说出的内容，不得夸大冲突，也不得输出私人敏感信息。
 文字可以轻松自然，但不得用侮辱、诽谤或煽动性措辞。对来源不足或语义不清的信息，要明确标注“记录不充分”而非补全。"""
@@ -354,17 +357,27 @@ def discover_recordings() -> None:
                 logging.warning("Could not inspect recording %s", path)
 
 
+def stop(*_: object) -> None:
+    global STOP
+    STOP = True
+
+
 def main() -> None:
     ensure_storage()
     init_db()
     remove_incomplete_segment_records()
+    requeue_interrupted_segments()
     if bailian_is_configured():
         requeue_dashscope_waiting_segments()
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
     owner = f"{socket.gethostname()}:{__import__('os').getpid()}"
-    while True:
+    while not STOP:
         discover_recordings()
         jobs = claim_segments(owner=owner)
         for job in jobs:
+            if STOP:
+                break
             path = Path(job["path"])
             try:
                 process(int(job["id"]), path)
@@ -381,7 +394,8 @@ def main() -> None:
                     update_segment(int(job["id"]), status="queued", attempts=attempts, error=str(exc),
                                    lease_owner=None, lease_expires_at=None)
                 logging.exception("Could not process %s", job["path"])
-        time.sleep(5 if jobs else 15)
+        if not STOP:
+            time.sleep(5 if jobs else 15)
 
 
 if __name__ == "__main__":

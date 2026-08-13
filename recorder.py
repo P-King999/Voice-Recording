@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import signal
 import sys
@@ -29,6 +30,7 @@ AUTO_DEVICE = "auto"
 CALLBACK_TIMEOUT_SECONDS = 10
 HEARTBEAT_PATH = RUNTIME_DIR / "recorder.heartbeat"
 WRITER_HEARTBEAT_PATH = RUNTIME_DIR / "recorder.writer.heartbeat"
+_WINDOWS_CONSOLE_HANDLER: object | None = None
 
 
 class RecoverableAudioError(RuntimeError):
@@ -38,6 +40,30 @@ class RecoverableAudioError(RuntimeError):
 def stop(*_: object) -> None:
     global STOP
     STOP = True
+
+
+def install_windows_shutdown_handler() -> None:
+    """Ask the recorder to finalize its current file before Windows shuts down."""
+    if os.name != "nt":
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    # Ctrl+logoff/shutdown are not exposed by Python's signal module.
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    @handler_type
+    def console_handler(event: int) -> bool:
+        if event in (0, 2, 5, 6):  # Ctrl+C, close, logoff, shutdown
+            stop()
+            return True
+        return False
+
+    global _WINDOWS_CONSOLE_HANDLER
+    _WINDOWS_CONSOLE_HANDLER = console_handler
+    if not ctypes.windll.kernel32.SetConsoleCtrlHandler(console_handler, True):
+        logging.warning("Could not install the Windows shutdown handler")
 
 
 def open_segment(started_at: datetime) -> tuple[Path, Path, sf.SoundFile]:
@@ -230,6 +256,7 @@ def record_once(force_auto_device: bool = False) -> None:
 
 def main() -> None:
     global STOP
+    install_windows_shutdown_handler()
     retry_delay = 2
     force_auto_device = False
     while not STOP:

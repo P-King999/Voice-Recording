@@ -757,14 +757,14 @@ with home_tab:
         today_records = [item for item in recent if record_recorded_at(item).date() == now.date()]
         today_column, recent_column = st.columns(2)
         for heading, items, column, prefix in (
-            ("本日", today_records[:8], today_column, "today"),
-            ("最近录音", recent[:8], recent_column, "recent"),
+            ("本日", today_records, today_column, "today"),
+            ("最近录音", recent, recent_column, "recent"),
         ):
             with column:
                 st.markdown(f"#### {heading}")
                 if not items:
                     st.caption("暂无录音")
-                visible_items = [item for item in items if not is_empty_record(item)]
+                visible_items = [item for item in items if not is_empty_record(item)][:8]
                 empty_items = [item for item in items if is_empty_record(item)]
                 for item in visible_items:
                     status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
