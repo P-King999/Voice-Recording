@@ -36,7 +36,9 @@ function Start-ManagedProcess {
 }
 
 Start-ManagedProcess -Name "recorder" -ExpectedArgument "recorder.py" -Arguments @("recorder.py")
+Start-ManagedProcess -Name "recorder_watchdog" -ExpectedArgument "recorder_watchdog.py" -Arguments @("recorder_watchdog.py")
 Start-ManagedProcess -Name "worker" -ExpectedArgument "worker.py" -Arguments @("worker.py")
+Start-ManagedProcess -Name "summary_scheduler" -ExpectedArgument "summary_scheduler.py" -Arguments @("summary_scheduler.py")
 Start-ManagedProcess -Name "keep_awake" -ExpectedArgument "keep_awake.py" -Arguments @("keep_awake.py")
 Start-ManagedProcess -Name "power_manager" -ExpectedArgument "power_manager.py" -Arguments @("power_manager.py")
 Start-ManagedProcess -Name "dashboard" -ExpectedArgument "streamlit" -Arguments @("-m", "streamlit", "run", "dashboard.py", "--server.headless=true", "--server.address=0.0.0.0", "--server.port=8501", "--browser.gatherUsageStats=false")

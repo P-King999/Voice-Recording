@@ -26,6 +26,13 @@ logging.basicConfig(
 )
 STOP = False
 AUTO_DEVICE = "auto"
+CALLBACK_TIMEOUT_SECONDS = 10
+HEARTBEAT_PATH = RUNTIME_DIR / "recorder.heartbeat"
+WRITER_HEARTBEAT_PATH = RUNTIME_DIR / "recorder.writer.heartbeat"
+
+
+class RecoverableAudioError(RuntimeError):
+    """An audio stream failed and should be reopened with a fresh device selection."""
 
 
 def stop(*_: object) -> None:
@@ -55,7 +62,7 @@ def finalize(final_path: Path, partial_path: Path, writer: sf.SoundFile, started
 
 
 def select_loudest_input_device() -> int:
-    """Sample each available input and return the device with the highest RMS level."""
+    """Prefer a usable system default input, then fall back to the loudest input."""
     candidates = [
         (index, device)
         for index, device in enumerate(sd.query_devices())
@@ -66,6 +73,8 @@ def select_loudest_input_device() -> int:
 
     measurements: list[tuple[float, int, str]] = []
     frames = max(1, round(settings.sample_rate * 0.5))
+    default_input = sd.default.device[0] if sd.default.device else None
+    default_measurement: tuple[float, int, str] | None = None
     for index, device in candidates:
         try:
             with sd.InputStream(
@@ -79,25 +88,46 @@ def select_loudest_input_device() -> int:
                 logging.warning("Input overflow while checking device %s", index)
             rms = float(np.sqrt(np.mean(np.square(samples))))
             measurements.append((rms, index, str(device["name"])))
+            if index == default_input:
+                default_measurement = measurements[-1]
             logging.info("Input device check: %s (%s), %.1f dBFS", index, device["name"], 20 * np.log10(max(rms, 1e-12)))
         except Exception as exc:
             logging.warning("Cannot check input device %s (%s): %s", index, device["name"], exc)
 
     if not measurements:
         raise RuntimeError("No audio input device supports the configured recording format")
-    level, index, name = max(measurements)
+    if default_measurement:
+        level, index, name = default_measurement
+        logging.info("Selected system default input device: %s (%s)", index, name)
+    else:
+        level, index, name = max(measurements)
     logging.info("Selected loudest input device: %s (%s), %.1f dBFS", index, name, 20 * np.log10(max(level, 1e-12)))
     return index
 
 
-def recording_device() -> str | int | None:
+def recording_device(force_auto: bool = False) -> str | int | None:
     """Use a manually selected device, or detect the loudest available microphone."""
-    if settings.device and settings.device.lower() != AUTO_DEVICE:
+    if not force_auto and settings.device and settings.device.lower() != AUTO_DEVICE:
+        if settings.device.isdigit():
+            # Earlier versions saved transient PortAudio indexes. Migrate a stale
+            # index to the local Realtek microphone instead of recording silence.
+            index = int(settings.device)
+            devices = sd.query_devices()
+            if 0 <= index < len(devices) and int(devices[index]["max_input_channels"]) >= settings.channels:
+                return index
+            realtek = next(
+                (str(device["name"]) for device in devices if "realtek" in str(device["name"]).lower()
+                 and int(device["max_input_channels"]) >= settings.channels),
+                None,
+            )
+            if realtek:
+                logging.warning("Configured device index %s is stale; using %s", settings.device, realtek)
+                return realtek
         return settings.device
     return select_loudest_input_device()
 
 
-def main() -> None:
+def record_once(force_auto_device: bool = False) -> None:
     global STOP
     ensure_storage()
     init_db()
@@ -105,19 +135,29 @@ def main() -> None:
     segment_frames = settings.segment_seconds * settings.sample_rate
     callback_blocks = 0
     written_blocks = 0
+    capture_error: str | None = None
+    last_callback = time.monotonic()
+    last_heartbeat = 0.0
 
-    def callback(indata: np.ndarray, frames: int, time: object, status: sd.CallbackFlags) -> None:
-        nonlocal callback_blocks
+    def callback(indata: np.ndarray, frames: int, callback_time: object, status: sd.CallbackFlags) -> None:
+        nonlocal callback_blocks, capture_error, last_callback, last_heartbeat
         callback_blocks += 1
+        last_callback = time.monotonic()
+        if last_callback - last_heartbeat >= 2:
+            HEARTBEAT_PATH.touch()
+            last_heartbeat = last_callback
         if callback_blocks == 1:
             logging.info("Audio callback started: frames=%s device=%s", frames, settings.device or "default")
         if status:
-            logging.warning("Audio status: %s", status)
+            capture_error = f"Audio stream status: {status}"
+            logging.error("%s; restarting recorder", capture_error)
+            raise sd.CallbackAbort
         try:
             audio_queue.put_nowait(indata.copy())
         except queue.Full:
             # A full queue means the disk writer cannot keep up. Stopping is preferable to silently losing audio.
-            logging.critical("Audio queue overflow; stopping recorder to prevent silent data loss")
+            capture_error = "Audio queue overflow; writer cannot keep up"
+            logging.critical("%s; restarting recorder", capture_error)
             raise sd.CallbackAbort
 
     signal.signal(signal.SIGINT, stop)
@@ -127,10 +167,9 @@ def main() -> None:
     writer: sf.SoundFile | None = None
     started_at: datetime | None = None
     written = 0
-    last_flush = time.monotonic()
 
     try:
-        device = recording_device()
+        device = recording_device(force_auto_device)
         logging.info("Starting recorder with device=%s", device)
         with sd.InputStream(
             samplerate=settings.sample_rate,
@@ -155,11 +194,18 @@ def main() -> None:
                 except queue.Empty:
                     if STOP:
                         break
+                    if capture_error:
+                        raise RecoverableAudioError(capture_error)
+                    if time.monotonic() - last_callback >= CALLBACK_TIMEOUT_SECONDS:
+                        raise RecoverableAudioError(
+                            f"No audio callback received for {CALLBACK_TIMEOUT_SECONDS} seconds"
+                        )
                     continue
                 offset = 0
                 written_blocks += 1
                 if written_blocks == 1:
                     logging.info("Audio writer started")
+                WRITER_HEARTBEAT_PATH.touch()
                 # Split an arriving callback buffer across segment boundaries exactly; no recording gap.
                 while offset < len(block):
                     capacity = segment_frames - written
@@ -172,16 +218,36 @@ def main() -> None:
                         started_at = datetime.now().astimezone()
                         final_path, partial_path, writer = open_segment(started_at)
                         written = 0
-                        last_flush = time.monotonic()
-                if time.monotonic() - last_flush >= 1:
-                    writer.flush()
-                    last_flush = time.monotonic()
+    except RecoverableAudioError:
+        raise
     except Exception:
         logging.exception("Recorder stopped unexpectedly")
         raise
     finally:
         if writer and final_path and partial_path and started_at:
             finalize(final_path, partial_path, writer, started_at, written)
+
+
+def main() -> None:
+    global STOP
+    retry_delay = 2
+    force_auto_device = False
+    while not STOP:
+        try:
+            record_once(force_auto_device)
+            retry_delay = 2
+        except RecoverableAudioError as exc:
+            logging.error("Recorder will retry after an audio failure: %s", exc)
+        except Exception:
+            logging.exception("Recorder stopped unexpectedly; will retry")
+            if settings.device and settings.device.lower() != AUTO_DEVICE:
+                force_auto_device = True
+                logging.warning("Configured input device is unavailable; falling back to automatic device selection")
+        if STOP:
+            break
+        logging.info("Retrying recorder in %s seconds", retry_delay)
+        time.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 30)
 
 
 if __name__ == "__main__":

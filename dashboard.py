@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import hmac
 import os
@@ -430,6 +431,9 @@ def period_details(choice: str, now: datetime) -> tuple[str, datetime, datetime,
         return "morning", midnight, min(now, noon), "本日上午"
     if choice == "本日下午":
         return "afternoon", noon, max(now, noon), "本日下午"
+    if choice == "本日晚上":
+        start = midnight + timedelta(hours=17)
+        return "evening", start, max(now, start), "本日晚上"
     if choice == "本周":
         start = midnight - timedelta(days=now.weekday())
         return "week", start, now, f"本周（{start:%m-%d} 至今）"
@@ -489,24 +493,83 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def device_family(name: str) -> str:
+    """Group Windows API copies of the same physical microphone."""
+    normalized = re.sub(r"\s+", " ", name.lower()).strip()
+    if "realtek" in normalized:
+        return "realtek"
+    if "mic device" in normalized:
+        return "mic-device"
+    if "edifier" in normalized:
+        return "edifier"
+    normalized = re.sub(r"\([^)]*\)", "", normalized)
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", normalized)
+
+
 def input_device_options() -> tuple[list[str], dict[str, str]]:
-    """Return stable PortAudio device IDs so the saved choice survives renamed devices."""
+    """Show physical microphones once, hiding Windows aliases and virtual endpoints."""
     options = ["auto"]
     labels = {"auto": "自动检测（选择声音最大的麦克风）"}
-    default_input = sd.default.device[0] if sd.default.device else None
+    hidden_markers = (
+        "sound mapper", "主声音捕获驱动程序", "primary sound capture", "stereo mix", "立体声混音",
+        "steelseries sonar", "vb-audio", "virtual cable", "voicemeeter",
+    )
     try:
         devices = sd.query_devices()
     except Exception:
         return options, labels
 
+    candidates: dict[str, tuple[int, str]] = {}
     for index, device in enumerate(devices):
         if int(device["max_input_channels"]) <= 0:
             continue
-        device_id = str(index)
-        default_marker = "（系统当前默认）" if index == default_input else ""
-        options.append(device_id)
-        labels[device_id] = f"{index}: {device['name']}{default_marker}"
+        name = str(device["name"])
+        if any(marker in name.lower() for marker in hidden_markers):
+            continue
+        family = device_family(name)
+        if not family:
+            continue
+        api_name = str(sd.query_hostapis(device["hostapi"])["name"])
+        # Prefer WASAPI, then DirectSound, over legacy MME and WDM-KS endpoints.
+        priority = {"Windows WASAPI": 0, "Windows DirectSound": 1, "MME": 2, "Windows WDM-KS": 3}.get(api_name, 4)
+        if family not in candidates or priority < candidates[family][0]:
+            candidates[family] = (priority, name)
+    for _, name in candidates.values():
+        options.append(name)
+        labels[name] = name
     return options, labels
+
+
+def saved_recording_device() -> str:
+    for line in read_env_document().splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "RECORDING_DEVICE":
+            return value.strip() or "auto"
+    return "auto"
+
+
+def microphone_test(device_choice: str) -> tuple[bytes, float]:
+    """Record three seconds from the selected device and return a playable WAV clip."""
+    if device_choice == "auto":
+        # Keep the test aligned with the recorder's automatic selection rule.
+        from recorder import select_loudest_input_device
+
+        device: str | int | None = select_loudest_input_device()
+    else:
+        device = device_choice
+    samples = sd.rec(
+        int(settings.sample_rate * 3),
+        samplerate=settings.sample_rate,
+        channels=settings.channels,
+        dtype="float32",
+        device=device,
+    )
+    sd.wait()
+    rms = float(np.sqrt(np.mean(np.square(samples))))
+    dbfs = 20 * float(np.log10(max(rms, 1e-12)))
+    wav = io.BytesIO()
+    sf.write(wav, samples, settings.sample_rate, format="WAV", subtype="PCM_16")
+    return wav.getvalue(), dbfs
 
 
 def restart_recorder(device_choice: str) -> None:
@@ -535,6 +598,9 @@ def restart_recorder(device_choice: str) -> None:
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     pid_path.write_text(str(process.pid), encoding="utf-8")
+    time_module.sleep(1)
+    if process.poll() is not None:
+        raise RuntimeError("录音器启动失败，请查看 runtime/recorder.error.log。")
 
 
 def render_live_recording() -> None:
@@ -613,7 +679,12 @@ def overview_title(record: dict[str, object]) -> str:
     if not title:
         analysis = parse_conversation_analysis(str(record.get("conversation_analysis") or ""))
         title = text_value(analysis.get("title"), "") if analysis else ""
-    return title if title and title != "空" else "未命名录音"
+    return title if title else "空"
+
+
+def is_empty_record(record: dict[str, object]) -> bool:
+    """Keep recordings without a meaningful analysis title out of the default list."""
+    return overview_title(record) == "空"
 
 
 def display_rating(record: dict[str, object]) -> int:
@@ -658,7 +729,7 @@ with home_tab:
     metrics[3].metric("处理失败", counts.get("failed", 0))
     st.subheader("时段汇总")
     now = datetime.now().astimezone()
-    choice = st.segmented_control("汇总范围", ["本日", "本日上午", "本日下午", "本周", "本月"], default="本日", key="home-summary-period")
+    choice = st.segmented_control("汇总范围", ["本日", "本日上午", "本日下午", "本日晚上", "本周", "本月"], default="本日", key="home-summary-period")
     period_type, period_start, period_end, period_label = period_details(choice or "本日", now)
     summary = get_period_summary(period_type, period_start)
     summary_left, summary_right = st.columns([5, 1])
@@ -693,7 +764,9 @@ with home_tab:
                 st.markdown(f"#### {heading}")
                 if not items:
                     st.caption("暂无录音")
-                for item in items:
+                visible_items = [item for item in items if not is_empty_record(item)]
+                empty_items = [item for item in items if is_empty_record(item)]
+                for item in visible_items:
                     status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
                     title, favorite_action, button = st.columns([4, 1, 1])
                     title.write(overview_title(item))
@@ -704,6 +777,19 @@ with home_tab:
                     if button.button("查看", key=f"{prefix}-{item['id']}"):
                         st.session_state["home_record_id"] = int(item["id"])
                         st.rerun()
+                if empty_items:
+                    with st.expander(f"空（{len(empty_items)} 条）", expanded=False):
+                        for item in empty_items:
+                            status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+                            title, favorite_action, button = st.columns([4, 1, 1])
+                            title.write(overview_title(item))
+                            title.caption(f"{rating_label(item)} · {record_recorded_at(item):%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
+                            if favorite_action.button("★" if item["favorite"] else "☆", key=f"{prefix}-empty-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
+                                toggle_favorite(int(item["id"]), item["favorite"])
+                                st.rerun()
+                            if button.button("查看", key=f"{prefix}-empty-{item['id']}"):
+                                st.session_state["home_record_id"] = int(item["id"])
+                                st.rerun()
         if "home_record_id" not in st.session_state:
             st.session_state["home_record_id"] = int((today_records or recent)[0]["id"])
         home_record_id = st.session_state.get("home_record_id")
@@ -757,7 +843,9 @@ with archive_tab:
     page_count = max(1, (total_results + page_size - 1) // page_size)
     st.caption(f"共 {total_results} 条录音，当前显示第 {page + 1} / {page_count} 页。")
     if results:
-        for item in results:
+        visible_results = [item for item in results if not is_empty_record(item)]
+        empty_results = [item for item in results if is_empty_record(item)]
+        for item in visible_results:
             status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
             title, timestamp, favorite_action, action = st.columns([5, 3, 1, 1])
             title.write(overview_title(item))
@@ -768,6 +856,19 @@ with archive_tab:
             if action.button("查看", key=f"archive-view-{item['id']}"):
                 st.session_state["archive_record_id"] = int(item["id"])
                 st.rerun()
+        if empty_results:
+            with st.expander(f"空（{len(empty_results)} 条）", expanded=False):
+                for item in empty_results:
+                    status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+                    title, timestamp, favorite_action, action = st.columns([5, 3, 1, 1])
+                    title.write(overview_title(item))
+                    timestamp.caption(f"{rating_label(item)} · {record_recorded_at(item):%Y-%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
+                    if favorite_action.button("★" if item["favorite"] else "☆", key=f"archive-empty-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
+                        toggle_favorite(int(item["id"]), item["favorite"])
+                        st.rerun()
+                    if action.button("查看", key=f"archive-empty-view-{item['id']}"):
+                        st.session_state["archive_record_id"] = int(item["id"])
+                        st.rerun()
         pager_left, pager_center, pager_right = st.columns([1, 4, 1])
         if pager_left.button("上一页", disabled=page == 0):
             st.session_state["archive_page"] = page - 1
@@ -816,19 +917,48 @@ with archive_tab:
 with settings_tab:
     st.subheader("录音设备与监听")
     device_options, device_labels = input_device_options()
-    selected_device = settings.device or "auto"
+    selected_device = saved_recording_device()
     if selected_device not in device_options:
         device_options.append(selected_device)
         device_labels[selected_device] = f"已保存设备：{selected_device}（当前不可用）"
-    device_choice = st.selectbox("麦克风", device_options, index=device_options.index(selected_device), format_func=lambda item: device_labels[item])
-    if st.button("保存并重启录音器"):
-        save_env_value("RECORDING_DEVICE", device_choice)
+    device_choice = st.selectbox(
+        "麦克风",
+        device_options,
+        index=device_options.index(selected_device),
+        format_func=lambda item: device_labels[item],
+    )
+    device_actions = st.columns(2)
+    if device_actions[0].button("测试麦克风"):
         try:
-            restart_recorder(device_choice)
-        except RuntimeError as exc:
-            st.error(str(exc))
+            with st.spinner("正在录制 3 秒测试音频..."):
+                clip, dbfs = microphone_test(device_choice)
+        except Exception as exc:
+            st.error(f"无法使用该麦克风：{exc}")
         else:
-            st.success("录音设备已保存，录音器已重启。")
+            st.session_state["microphone_test_clip"] = clip
+            st.session_state["microphone_test_dbfs"] = dbfs
+    if "microphone_test_clip" in st.session_state:
+        test_dbfs = float(st.session_state["microphone_test_dbfs"])
+        st.audio(st.session_state["microphone_test_clip"], format="audio/wav")
+        st.success(f"声音测试完成：{test_dbfs:.1f} dBFS" if test_dbfs >= settings.silence_threshold_dbfs else f"声音测试完成，但音量偏低：{test_dbfs:.1f} dBFS")
+    if device_actions[1].button("保存并切换"):
+        try:
+            if device_choice != "auto":
+                sd.check_input_settings(
+                    device=device_choice,
+                    samplerate=settings.sample_rate,
+                    channels=settings.channels,
+                    dtype="float32",
+                )
+            save_env_value("RECORDING_DEVICE", device_choice)
+            restart_recorder(device_choice)
+        except Exception as exc:
+            st.error(f"切换失败：{exc}")
+        else:
+            st.session_state["recording_device_changed"] = device_labels[device_choice]
+            st.rerun()
+    if changed_device := st.session_state.pop("recording_device_changed", None):
+        st.success(f"已切换到 {changed_device}，录音器已重新启动。")
     if st.toggle("实时监听", key="live_monitor_enabled"):
         if hasattr(st, "fragment"):
             st.fragment(run_every=1)(render_live_monitor)()

@@ -7,7 +7,7 @@ import smtplib
 import ssl
 import time
 from collections import Counter
-from datetime import datetime, time as clock_time
+from datetime import datetime, time as clock_time, timedelta
 from email.message import EmailMessage
 
 import requests
@@ -85,51 +85,74 @@ def _latest_event_text(lines: list[str]) -> str:
     return "录音器正在运行。"
 
 
-def _morning_summary(start: datetime, end: datetime) -> tuple[str, str | None]:
+STATUS_LABELS = {
+    "queued": "等待处理",
+    "transcribing": "转写中",
+    "complete": "已完成",
+    "silent": "已过滤静音",
+    "failed": "处理失败",
+    "awaiting_dashscope_config": "等待转写配置",
+}
+
+
+def _period_summary(period_type: str, start: datetime, end: datetime, label: str) -> tuple[str, str | None]:
     transcript, source_count = period_transcript(start, end)
-    existing = get_period_summary("morning", start)
-    if existing and existing["summary"] and int(existing["source_segment_count"]) == source_count:
+    existing = get_period_summary(period_type, start)
+    if existing and existing["summary"]:
         return str(existing["summary"]), str(existing["provider"])
 
     if not transcript:
-        return "上午没有可用的逐字稿，因此未生成内容摘要。", None
+        return f"{label}没有可用的逐字稿，因此未生成内容摘要。", None
     try:
-        # Generate only when the dashboard has not already saved the same morning summary.
+        # Generate only when the dashboard has not already saved the same period summary.
         from worker import generate_period_summary
 
-        summary, provider = generate_period_summary("morning", start, end, "本日上午")
-        logging.info("已为定时报告生成上午摘要，来源分段数：%s", source_count)
+        summary, provider = generate_period_summary(period_type, start, end, label)
+        logging.info("已为定时报告生成%s摘要，来源分段数：%s", label, source_count)
         return summary, provider
     except Exception as exc:
-        logging.exception("无法为定时报告生成上午摘要")
-        return f"上午已有 {source_count} 个可用逐字稿分段，但摘要生成失败：{exc}", None
+        logging.exception("无法为定时报告生成%s摘要", label)
+        return f"{label}已有 {source_count} 个可用逐字稿分段，但摘要生成失败：{exc}", None
+
+
+def report_summary_window(now: datetime) -> tuple[str, datetime, datetime]:
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if now.time() < clock_time(12, 10):
+        return "morning", day_start, day_start + timedelta(hours=12)
+    if now.time() < clock_time(17, 10):
+        return "afternoon", day_start + timedelta(hours=12), day_start + timedelta(hours=17)
+    if now.time() < clock_time(21, 10):
+        return "evening", day_start + timedelta(hours=17), day_start + timedelta(hours=21)
+    return "day", day_start, day_start + timedelta(hours=21)
 
 
 def build_report(now: datetime | None = None) -> tuple[str, str]:
     now = now or datetime.now().astimezone()
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    morning_end = now.replace(hour=12, minute=0, second=0, microsecond=0)
-    morning_rows = _local_rows(day_start, morning_end)
-    all_rows = _local_rows(day_start, now)
-    statuses = Counter(str(row["status"]) for row in morning_rows)
-    active_seconds = sum(float(row["active_seconds"] or 0) for row in morning_rows)
-    recorded_seconds = sum(float(row["duration_seconds"] or 0) for row in morning_rows)
+    summary_type, report_start, report_end = report_summary_window(now)
+    period_labels = {"morning": "本日上午", "afternoon": "本日下午", "evening": "本日晚上", "day": "本日"}
+    period_label = period_labels[summary_type]
+    period_heading = f"{period_label}录音（{report_start:%H:%M}-{report_end:%H:%M}）"
+    period_rows = _local_rows(report_start, report_end)
+    statuses = Counter(str(row["status"]) for row in period_rows)
+    active_seconds = sum(float(row["active_seconds"] or 0) for row in period_rows)
+    recorded_seconds = sum(float(row["duration_seconds"] or 0) for row in period_rows)
     service_state = snapshot(ROOT)
     recorder_lines = _recorder_log_lines(now)
     last_event = _latest_event_text(recorder_lines)
     services_ok = all(bool(value) for value in service_state["services"].values())
-    summary, provider = _morning_summary(day_start, min(morning_end, now))
+    summary, provider = _period_summary(summary_type, report_start, report_end, period_label)
+    status_text = "，".join(f"{STATUS_LABELS.get(name, name)} {count}" for name, count in sorted(statuses.items()))
 
     lines = [
         f"生成时间：{now:%Y-%m-%d %H:%M}",
         "",
-        "上午录音（00:00-12:00）",
-        f"- 已完成分段：{len(morning_rows)} 个；总录音时长：{recorded_seconds / 3600:.1f} 小时。",
-        "- 处理状态：" + ("，".join(f"{name} {count}" for name, count in sorted(statuses.items())) or "没有已完成分段"),
+        period_heading,
+        f"- 已完成分段：{len(period_rows)} 个；总录音时长：{recorded_seconds / 3600:.1f} 小时。",
+        "- 处理状态：" + (status_text or "没有已完成分段"),
         f"- 检测到的活跃语音：{active_seconds:.1f} 秒。",
         "- 被识别为静音的录音不会包含逐字稿。",
         "",
-        "上午摘要",
+        f"{period_label}摘要",
         summary,
         *([f"- 摘要模型：{provider}。"] if provider else []),
         "",
@@ -140,12 +163,12 @@ def build_report(now: datetime | None = None) -> tuple[str, str]:
         f"- 最新录音事件：{last_event}",
         "",
         "今日截至目前",
-        f"- 已完成分段：{len(all_rows)} 个。",
+        f"- 已完成分段：{len(period_rows)} 个。",
     ]
-    if morning_rows and active_seconds == 0:
-        lines.append("- 上午录音已正常保存，但没有检测到超过当前阈值的语音。")
-    if not morning_rows:
-        lines.append("- 本次报告生成时，尚无已完成的上午录音分段。")
+    if period_rows and active_seconds == 0:
+        lines.append(f"- {period_label}录音已正常保存，但没有检测到超过当前阈值的语音。")
+    if not period_rows:
+        lines.append(f"- 本次报告生成时，尚无已完成的{period_label}录音分段。")
     return f"录音日报 - {now:%Y-%m-%d}", "\n".join(lines)
 
 

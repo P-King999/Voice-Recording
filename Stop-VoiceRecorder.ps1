@@ -5,7 +5,9 @@ $RuntimeDir = Join-Path $ProjectRoot "runtime"
 
 ${ExpectedArguments} = @{
     "recorder" = "recorder.py"
+    "recorder_watchdog" = "recorder_watchdog.py"
     "worker" = "worker.py"
+    "summary_scheduler" = "summary_scheduler.py"
     "keep_awake" = "keep_awake.py"
     "power_manager" = "power_manager.py"
     "dashboard" = "streamlit"
@@ -20,7 +22,9 @@ foreach ($Name in $ExpectedArguments.Keys) {
     if ($ProcessId -match '^\d+$') {
         $Process = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
         if ($null -ne $Process -and $Process.CommandLine -like "*$($ExpectedArguments[$Name])*" ) {
-            Stop-Process -Id $ProcessId -Force
+            # The virtual-environment launcher can leave the actual Python child alive.
+            # End the verified managed process and its descendants together.
+            & "$env:WINDIR\System32\taskkill.exe" /PID $ProcessId /T /F | Out-Null
         }
     }
     Remove-Item -LiteralPath $PidFile -Force

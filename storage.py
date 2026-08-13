@@ -147,6 +147,20 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summary_jobs (
+                job_key TEXT PRIMARY KEY,
+                period_type TEXT NOT NULL,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                completed_at TEXT,
+                error TEXT
+            )
+            """
+        )
 
 
 def add_segment(path: Path, recorded_at: datetime, duration_seconds: float, status: str = "queued") -> None:
@@ -429,6 +443,19 @@ def period_transcript(start: datetime, end: datetime) -> tuple[str, int]:
     return "\n\n".join(parts), len(parts)
 
 
+def period_has_pending_segments(start: datetime, end: datetime) -> bool:
+    """Whether recordings in a closed period are still waiting for transcription."""
+    with transaction() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM segments
+               WHERE recorded_at >= ? AND recorded_at < ?
+                 AND status IN ('queued', 'transcribing')
+               LIMIT 1""",
+            (start.astimezone(timezone.utc).isoformat(), end.astimezone(timezone.utc).isoformat()),
+        ).fetchone()
+    return row is not None
+
+
 def get_period_summary(period_type: str, period_start: datetime) -> sqlite3.Row | None:
     with transaction() as conn:
         return conn.execute(
@@ -451,4 +478,47 @@ def save_period_summary(
                  source_segment_count = excluded.source_segment_count,
                  generated_at = excluded.generated_at""",
             (period_type, period_start.isoformat(), summary, provider, source_segment_count, now()),
+        )
+
+
+def claim_summary_job(
+    job_key: str, period_type: str, period_start: datetime, period_end: datetime, stale_after_seconds: int = 1800
+) -> bool:
+    """Claim one scheduled summary exactly once, recovering only abandoned in-progress claims."""
+    claimed_at = now()
+    stale_before = datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() - stale_after_seconds, timezone.utc
+    ).isoformat(timespec="seconds")
+    with transaction() as conn:
+        inserted = conn.execute(
+            """INSERT OR IGNORE INTO summary_jobs
+               (job_key, period_type, period_start, period_end, status, claimed_at)
+               VALUES (?, ?, ?, ?, 'running', ?)""",
+            (job_key, period_type, period_start.isoformat(), period_end.isoformat(), claimed_at),
+        )
+        if inserted.rowcount:
+            return True
+        recovered = conn.execute(
+            """UPDATE summary_jobs SET status = 'running', claimed_at = ?, completed_at = NULL, error = NULL
+               WHERE job_key = ?
+                 AND ((status = 'running' AND claimed_at <= ?)
+                      OR (status = 'failed' AND completed_at <= ?))""",
+            (claimed_at, job_key, stale_before, stale_before),
+        )
+        return bool(recovered.rowcount)
+
+
+def complete_summary_job(job_key: str) -> None:
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE summary_jobs SET status = 'complete', completed_at = ?, error = NULL WHERE job_key = ?",
+            (now(), job_key),
+        )
+
+
+def fail_summary_job(job_key: str, error: str) -> None:
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE summary_jobs SET status = 'failed', completed_at = ?, error = ? WHERE job_key = ?",
+            (now(), error[:2000], job_key),
         )

@@ -130,7 +130,7 @@ class Settings:
     disk_warning_gb: float = float(os.getenv("DISK_WARNING_GB", "10"))
     report_enabled: bool = os.getenv("REPORT_ENABLED", "false").lower() == "true"
     report_times: tuple[str, ...] = tuple(
-        value.strip() for value in os.getenv("REPORT_TIMES", "12:10,18:10").split(",") if value.strip()
+        value.strip() for value in os.getenv("REPORT_TIMES", "12:10,17:10,21:10").split(",") if value.strip()
     )
     report_channels: tuple[str, ...] = tuple(
         value.strip().lower() for value in os.getenv("REPORT_CHANNELS", "smtp").split(",") if value.strip()
@@ -146,6 +146,9 @@ class Settings:
     report_imap_host: str = os.getenv("REPORT_IMAP_HOST", "imap.qq.com").strip()
     report_imap_port: int = env_int("REPORT_IMAP_PORT", 993)
     report_query_interval_seconds: int = env_int("REPORT_QUERY_INTERVAL_SECONDS", 60)
+    summary_scheduler_interval_seconds: int = env_int("SUMMARY_SCHEDULER_INTERVAL_SECONDS", 60)
+    summary_lookback_days: int = env_int("SUMMARY_LOOKBACK_DAYS", 7)
+    summary_finalize_delay_seconds: int = env_int("SUMMARY_FINALIZE_DELAY_SECONDS", 30)
 
 
 settings = Settings()

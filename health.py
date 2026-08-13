@@ -45,7 +45,7 @@ def snapshot(root: Path) -> dict[str, object]:
         database_error = str(exc)
     services = {
         name: _pid_alive(runtime / f"{name}.pid")
-        for name in ("recorder", "worker", "dashboard", "keep_awake", "power_manager", "reporter", "mail_query")
+        for name in ("recorder", "worker", "summary_scheduler", "dashboard", "keep_awake", "power_manager", "reporter", "mail_query")
     }
     return {
         "database_ok": database_ok,
