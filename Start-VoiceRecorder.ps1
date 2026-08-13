@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RuntimeDir = Join-Path $ProjectRoot "runtime"
-$Pythonw = Join-Path $ProjectRoot ".venv\Scripts\pythonw.exe"
+$Pythonw = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath $Pythonw)) {
     throw "Virtual environment not found. Follow the first-install steps in README.md."
@@ -38,4 +38,7 @@ function Start-ManagedProcess {
 Start-ManagedProcess -Name "recorder" -ExpectedArgument "recorder.py" -Arguments @("recorder.py")
 Start-ManagedProcess -Name "worker" -ExpectedArgument "worker.py" -Arguments @("worker.py")
 Start-ManagedProcess -Name "keep_awake" -ExpectedArgument "keep_awake.py" -Arguments @("keep_awake.py")
+Start-ManagedProcess -Name "power_manager" -ExpectedArgument "power_manager.py" -Arguments @("power_manager.py")
 Start-ManagedProcess -Name "dashboard" -ExpectedArgument "streamlit" -Arguments @("-m", "streamlit", "run", "dashboard.py", "--server.headless=true", "--server.address=0.0.0.0", "--server.port=8501", "--browser.gatherUsageStats=false")
+Start-ManagedProcess -Name "reporter" -ExpectedArgument "reporter.py" -Arguments @("reporter.py")
+Start-ManagedProcess -Name "mail_query" -ExpectedArgument "mail_query.py" -Arguments @("mail_query.py")

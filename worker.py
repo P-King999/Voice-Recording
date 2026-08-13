@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import time
+import socket
 from datetime import date, datetime
 from pathlib import Path
 
@@ -21,10 +22,11 @@ from storage import (
     add_segment,
     init_db,
     period_transcript,
-    queued_segments,
+    claim_segments,
     remove_incomplete_segment_records,
     requeue_dashscope_waiting_segments,
     save_period_summary,
+    save_summary_version,
     update_segment,
 )
 
@@ -70,6 +72,8 @@ CONVERSATION_USER_PROMPT = """请分析以下一段录音逐字稿。时间戳�
 {
   "title": "不超过 16 个汉字的录音标题；有实质内容时概括最主要话题，没有实质内容时必须为“空”",
   "overview": "100 字以内的整体摘要",
+  "excitement_rating": "1 到 5 的整数。1=教学或纯工作讲解；2=日常聊天；3=明确人物关系、背景或动态；4=明确的矛盾、争吵、个人习惯或值得重点关注的内容；5=有充分原话依据的超级劲爆重大事件。只按录音证据评分，不得为了吸引眼球抬高分数。",
+  "highlight_quotes": ["评分 3 星及以上时，从逐字稿原文摘录 1 到 3 段不超过 30 字的关键原话；必须逐字匹配原文。1-2 星返回空数组。"],
   "speaker_map": [
     {
       "source_speaker": "原始说话人编号；没有编号则省略",
@@ -84,6 +88,7 @@ CONVERSATION_USER_PROMPT = """请分析以下一段录音逐字稿。时间戳�
       "type": "明确事实|转述传闻|信息不足",
       "details": "具体聊了什么",
       "people": ["相关人物"],
+      "excitement_rating": "该事件的 1 到 5 星评分，遵循整体评分标准",
       "evidence_quote": "不超过 30 字的原话",
       "confidence": "high|medium|low",
       "caution": "传闻或不充分信息的必要说明"
@@ -114,7 +119,9 @@ CONVERSATION_USER_PROMPT = """请分析以下一段录音逐字稿。时间戳�
         {"point": "最终安排", "details": "没有则写未形成明确结论"}
       ],
       "outcome": "结论或未形成明确结论",
-      "action_items": ["明确的待办；没有则为空数组"]
+      "action_items": [
+        {"task": "明确的待办", "owner": "明确负责人或未明确", "due_date": "明确日期或未明确", "evidence": "原话依据"}
+      ]
     }
   ]
 }
@@ -139,7 +146,7 @@ def audio_activity(path: Path) -> tuple[float, float]:
     return float(20 * np.log10(max(rms, 1e-12))), active_samples / sample_rate
 
 
-def convert_to_mp3(path: Path) -> Path:
+def convert_to_mp3(segment_id: int, path: Path) -> Path:
     if path.suffix.lower() == ".mp3":
         return path
     target = path.with_suffix(".mp3")
@@ -149,7 +156,7 @@ def convert_to_mp3(path: Path) -> Path:
     subprocess.run(command, check=True, timeout=3600, creationflags=subprocess.CREATE_NO_WINDOW)
     if not target.exists() or target.stat().st_size == 0:
         raise RuntimeError("MP3 转换没有生成有效文件。")
-    update_segment(path, path=str(target))
+    update_segment(segment_id, path=str(target))
     path.unlink()
     return target
 
@@ -194,7 +201,8 @@ def summarize_with_deepseek(transcript: str, period_label: str, model: str) -> s
     return response.json()["choices"][0]["message"]["content"]
 
 
-def conversation_source(transcript: str, raw_timeline: str | None) -> str:
+def conversation_source(transcript: str | None, raw_timeline: str | None) -> str:
+    transcript = transcript.strip() if isinstance(transcript, str) else ""
     if not raw_timeline:
         return transcript
     try:
@@ -228,7 +236,20 @@ def _json_object(content: str) -> dict[str, object]:
     return result
 
 
-def analyze_transcript_conversation(transcript: str, raw_timeline: str | None) -> dict[str, object]:
+def _excitement_rating(raw_analysis: str | None) -> int:
+    if not raw_analysis:
+        return 1
+    try:
+        value = json.loads(raw_analysis).get("excitement_rating", 1)
+        return min(5, max(1, int(value)))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 1
+
+
+def analyze_transcript_conversation(transcript: str | None, raw_timeline: str | None) -> dict[str, object]:
+    source = conversation_source(transcript, raw_timeline)
+    if not source:
+        raise ValueError("该录音还没有可用的逐字稿，无法生成对话分析。")
     if not settings.llm_key:
         raise RuntimeError("未配置 DeepSeek API Key。")
     response = requests.post(
@@ -238,7 +259,7 @@ def analyze_transcript_conversation(transcript: str, raw_timeline: str | None) -
             "model": settings.llm_model,
             "messages": [
                 {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
-                {"role": "user", "content": CONVERSATION_USER_PROMPT + conversation_source(transcript, raw_timeline)},
+                {"role": "user", "content": CONVERSATION_USER_PROMPT + source},
             ],
             "temperature": 0.2,
         },
@@ -272,28 +293,28 @@ def generate_period_summary(
         raise ValueError("该时段没有可用于分析的逐字稿。")
     summary, provider = summarize(transcript, period_label, selected_mode)
     save_period_summary(period_type, start, summary, provider, source_count)
+    save_summary_version(period_type, start, summary, provider, source_count)
     return summary, provider
 
 
-def process(path: Path) -> None:
+def process(segment_id: int, path: Path) -> None:
     if not path.exists():
-        update_segment(path, status="failed", error="本地音频文件不存在。")
+        update_segment(segment_id, status="failed", error="本地音频文件不存在。", lease_owner=None, lease_expires_at=None)
         return
     dbfs, active_seconds = audio_activity(path)
-    update_segment(path, dbfs=dbfs, active_seconds=active_seconds)
+    update_segment(segment_id, dbfs=dbfs, active_seconds=active_seconds)
     if active_seconds < settings.min_active_seconds:
         silent_path = SILENT_DIR / path.name
         shutil.move(str(path), silent_path)
-        update_segment(path, path=str(silent_path), status="silent")
+        update_segment(segment_id, path=str(silent_path), status="silent", lease_owner=None, lease_expires_at=None)
         return
     if settings.stt_provider != "dashscope_filetrans":
-        update_segment(path, status="awaiting_dashscope_config", error="当前仅启用百炼文件转写。")
+        update_segment(segment_id, status="awaiting_dashscope_config", error="当前仅启用百炼文件转写。", lease_owner=None, lease_expires_at=None)
         return
     if not bailian_is_configured():
-        update_segment(path, status="awaiting_dashscope_config", error="未配置百炼 API Key；本地音频已保留。")
+        update_segment(segment_id, status="awaiting_dashscope_config", error="未配置百炼 API Key；本地音频已保留。", lease_owner=None, lease_expires_at=None)
         return
-    mp3_path = convert_to_mp3(path)
-    update_segment(mp3_path, status="transcribing", error=None)
+    mp3_path = convert_to_mp3(segment_id, path)
     result = bailian_transcribe(mp3_path)
     timeline = json.dumps(result.timeline, ensure_ascii=False) if result.timeline else None
     conversation_analysis = None
@@ -307,13 +328,16 @@ def process(path: Path) -> None:
             conversation_analysis_error = str(exc)
             logging.exception("Could not analyze transcript %s", mp3_path.name)
     update_segment(
-        mp3_path,
+        segment_id,
         status="complete",
         transcript=result.transcript,
         transcript_timeline=timeline,
         conversation_analysis=conversation_analysis,
         conversation_analysis_error=conversation_analysis_error,
+        excitement_rating=_excitement_rating(conversation_analysis),
         error=None,
+        lease_owner=None,
+        lease_expires_at=None,
     )
     logging.info("Transcribed %s", mp3_path.name)
 
@@ -336,23 +360,26 @@ def main() -> None:
     remove_incomplete_segment_records()
     if bailian_is_configured():
         requeue_dashscope_waiting_segments()
+    owner = f"{socket.gethostname()}:{__import__('os').getpid()}"
     while True:
         discover_recordings()
-        jobs = queued_segments()
+        jobs = claim_segments(owner=owner)
         for job in jobs:
             path = Path(job["path"])
             try:
-                process(path)
+                process(int(job["id"]), path)
             except Exception as exc:
-                attempts = job["attempts"] + 1
+                attempts = job["attempts"]
                 if attempts >= 5:
                     target = FAILED_DIR / path.name
                     if path.exists():
                         shutil.move(str(path), target)
                         path = target
-                    update_segment(Path(job["path"]), path=str(path), status="failed", attempts=attempts, error=str(exc))
+                    update_segment(int(job["id"]), path=str(path), status="failed", attempts=attempts,
+                                   error=str(exc), lease_owner=None, lease_expires_at=None)
                 else:
-                    update_segment(Path(job["path"]), attempts=attempts, error=str(exc))
+                    update_segment(int(job["id"]), status="queued", attempts=attempts, error=str(exc),
+                                   lease_owner=None, lease_expires_at=None)
                 logging.exception("Could not process %s", job["path"])
         time.sleep(5 if jobs else 15)
 

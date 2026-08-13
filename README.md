@@ -57,6 +57,8 @@ Copy-Item .env.example .env
 
 打开浏览器访问 `http://localhost:8501`，或双击 `Open-Dashboard.cmd`。页面只负责展示，关闭浏览器不会停止录音。
 
+首次启动前，请在 `.env` 中设置 `DASHBOARD_PASSWORD`。看板未设置密码时会拒绝访问；密码只用于网页登录，不会写入数据库。
+
 ### 4.1 在手机上查看（局域网）
 
 首次开启局域网访问时，以管理员身份打开 PowerShell 并在项目目录执行：
@@ -105,6 +107,16 @@ Copy-Item .env.example .env
 
 该命令只停止本项目启动的后台进程，不会影响其他 Python 程序。若还启用了登录自启，请另行执行 `Uninstall-AutoStart.ps1`，否则下次登录会再次启动。
 
+## Local Scheduled Reports
+
+`reporter.py` starts alongside the recorder. Set `REPORT_ENABLED=true` to generate a short report at `12:10` and `18:10` every day. The report prioritizes the current morning's recording, silent/transcription state, service health, disk capacity, and the morning content summary. If a summary has not yet been generated in the dashboard, the reporter creates one from completed transcripts before it sends.
+
+By default it sends with QQ Mail SMTP to `sp.99@qq.com`. Set `REPORT_SMTP_AUTH_CODE` in `.env` to the QQ Mail SMTP authorization code, not the QQ account password. You can instead set `REPORT_CHANNELS=wecom` with an enterprise WeChat robot webhook, or `REPORT_CHANNELS=pushplus` with a PushPlus token. Personal WeChat accounts do not provide a stable official bot API, so direct personal-account delivery is not supported.
+
+## QQ Mail Query
+
+With QQ IMAP enabled, the local `mail_query.py` service checks the inbox once per minute. Send an email from `sp.99@qq.com` to itself with any subject or body text to receive the current report. Include a date such as `2026-08-12` or `2026年8月12日` in the subject or body to receive the historical report for that date. Only messages sent by the same configured QQ account are processed; other senders are ignored. System-generated reports are marked and ignored to prevent reply loops. The service starts from new messages only and does not reply to old inbox messages.
+
 ## 数据位置
 
 - `data/recordings`：有声音的 MP3 和等待处理的音频。
@@ -112,5 +124,7 @@ Copy-Item .env.example .env
 - `data/failed`：多次处理失败的音频。
 - `data/voice_recorder.sqlite3`：片段、逐字稿和时段分析。
 - `runtime`：后台日志与进程 PID 文件。
+
+看板支持全文搜索、日期/人物/话题/状态筛选，标签、收藏、备注、逐句书签、批量重试/删除/导出，以及自定义说话人名称。汇总会保留历史版本，录音逐字稿可导出为 Markdown、Word（兼容格式）和 SRT。
 
 这些目录均不上传 GitHub。录音涉及他人隐私和当地法律要求，请在录音前取得适当授权。

@@ -7,7 +7,10 @@ ${ExpectedArguments} = @{
     "recorder" = "recorder.py"
     "worker" = "worker.py"
     "keep_awake" = "keep_awake.py"
+    "power_manager" = "power_manager.py"
     "dashboard" = "streamlit"
+    "reporter" = "reporter.py"
+    "mail_query" = "mail_query.py"
 }
 
 foreach ($Name in $ExpectedArguments.Keys) {
