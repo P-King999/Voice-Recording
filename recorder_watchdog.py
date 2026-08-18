@@ -12,7 +12,6 @@ from config import ROOT
 RUNTIME_DIR = ROOT / "runtime"
 PID_PATH = RUNTIME_DIR / "recorder.pid"
 HEARTBEAT_PATH = RUNTIME_DIR / "recorder.heartbeat"
-WRITER_HEARTBEAT_PATH = RUNTIME_DIR / "recorder.writer.heartbeat"
 LOG_PATH = RUNTIME_DIR / "recorder_watchdog.log"
 STALE_SECONDS = 30
 
@@ -47,19 +46,23 @@ def restart_recorder(pid: int) -> None:
 
 def main() -> None:
     last_restart = 0.0
+    recorder_started_at = time.monotonic()
     while True:
         pid = recorder_pid()
         if pid is None:
             start_recorder()
-        elif (
-            not HEARTBEAT_PATH.exists()
-            or not WRITER_HEARTBEAT_PATH.exists()
-            or time.time() - HEARTBEAT_PATH.stat().st_mtime > STALE_SECONDS
-            or time.time() - WRITER_HEARTBEAT_PATH.stat().st_mtime > STALE_SECONDS
-        ):
-            if time.monotonic() - last_restart >= STALE_SECONDS:
+            recorder_started_at = time.monotonic()
+        elif not HEARTBEAT_PATH.exists() or time.time() - HEARTBEAT_PATH.stat().st_mtime > STALE_SECONDS:
+            now = time.monotonic()
+            # A process may need a few seconds after Windows sign-in before the
+            # microphone driver is ready. Do not restart it during that window.
+            if (
+                now - recorder_started_at >= STALE_SECONDS
+                and now - last_restart >= STALE_SECONDS
+            ):
                 restart_recorder(pid)
                 last_restart = time.monotonic()
+                recorder_started_at = last_restart
         time.sleep(5)
 
 

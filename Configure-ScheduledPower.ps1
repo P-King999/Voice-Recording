@@ -1,17 +1,7 @@
-param(
-    [ValidatePattern('^(?:[01]\d|2[0-3]):[0-5]\d$')]
-    [string]$ShutdownTime = "21:00"
-)
-
 $ErrorActionPreference = "Stop"
 
-$ShutdownTask = "Voice Recorder - Daily Shutdown"
-
-$shutdownAction = New-ScheduledTaskAction -Execute "$env:WINDIR\System32\shutdown.exe" `
-    -Argument "/s /t 60 /d p:0:0 /c `"Voice Recorder scheduled shutdown`""
-$shutdownTrigger = New-ScheduledTaskTrigger -Daily -At $ShutdownTime
-$systemSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable
-Register-ScheduledTask -TaskName $ShutdownTask -Action $shutdownAction -Trigger $shutdownTrigger `
-    -Settings $systemSettings -User "SYSTEM" -RunLevel Highest -Force | Out-Null
-
-Write-Host "Scheduled daily shutdown at $ShutdownTime."
+# Automatic shutdown is intentionally unsupported. Clean up a task created by
+# older versions so running this script can never schedule a future shutdown.
+Unregister-ScheduledTask -TaskName "Voice Recorder - Daily Shutdown" -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "Voice Recorder - Daily Wake" -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host "Automatic shutdown is disabled; any legacy Voice Recorder power tasks were removed."

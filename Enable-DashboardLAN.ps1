@@ -26,4 +26,19 @@ $rule.Profiles = 2 # Private
 $rule.Enabled = $true
 $policy.Rules.Add($rule)
 
-Write-Host "Private-network firewall access enabled for the dashboard on TCP port 8501."
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$EnvironmentPath = Join-Path $ProjectRoot ".env"
+$lines = if (Test-Path -LiteralPath $EnvironmentPath) { Get-Content -LiteralPath $EnvironmentPath } else { @() }
+$updated = $false
+$lines = foreach ($line in $lines) {
+    if ($line -match '^\s*DASHBOARD_BIND_ADDRESS=') {
+        $updated = $true
+        "DASHBOARD_BIND_ADDRESS=0.0.0.0"
+    } else {
+        $line
+    }
+}
+if (-not $updated) { $lines += "DASHBOARD_BIND_ADDRESS=0.0.0.0" }
+Set-Content -LiteralPath $EnvironmentPath -Value $lines -Encoding utf8
+
+Write-Host "Private-network firewall access enabled. Restart Voice Recorder to apply DASHBOARD_BIND_ADDRESS=0.0.0.0."

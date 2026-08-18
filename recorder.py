@@ -20,6 +20,7 @@ from storage import add_segment, init_db
 RUNTIME_DIR = ROOT / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 RESTART_REQUEST_PATH = RUNTIME_DIR / "recorder.restart"
+STOP_REQUEST_PATH = RUNTIME_DIR / "recorder.stop"
 logging.basicConfig(
     filename=RUNTIME_DIR / "recorder.log",
     level=logging.INFO,
@@ -87,8 +88,13 @@ def finalize(final_path: Path, partial_path: Path, writer: sf.SoundFile, started
     logging.info("Saved %s (%.1fs)", final_path.name, frames / settings.sample_rate)
 
 
+def touch_heartbeat() -> None:
+    """Show the watchdog that the recorder is alive, including while retrying."""
+    HEARTBEAT_PATH.touch()
+
+
 def select_loudest_input_device() -> int:
-    """Prefer a usable system default input, then fall back to the loudest input."""
+    """Prefer the system default input so recording begins without probing every device."""
     candidates = [
         (index, device)
         for index, device in enumerate(sd.query_devices())
@@ -97,37 +103,15 @@ def select_loudest_input_device() -> int:
     if not candidates:
         raise RuntimeError("No audio input devices are available")
 
-    measurements: list[tuple[float, int, str]] = []
-    frames = max(1, round(settings.sample_rate * 0.5))
     default_input = sd.default.device[0] if sd.default.device else None
-    default_measurement: tuple[float, int, str] | None = None
-    for index, device in candidates:
-        try:
-            with sd.InputStream(
-                samplerate=settings.sample_rate,
-                channels=settings.channels,
-                dtype="float32",
-                device=index,
-            ) as stream:
-                samples, overflowed = stream.read(frames)
-            if overflowed:
-                logging.warning("Input overflow while checking device %s", index)
-            rms = float(np.sqrt(np.mean(np.square(samples))))
-            measurements.append((rms, index, str(device["name"])))
-            if index == default_input:
-                default_measurement = measurements[-1]
-            logging.info("Input device check: %s (%s), %.1f dBFS", index, device["name"], 20 * np.log10(max(rms, 1e-12)))
-        except Exception as exc:
-            logging.warning("Cannot check input device %s (%s): %s", index, device["name"], exc)
+    candidate_by_index = {index: device for index, device in candidates}
+    if default_input in candidate_by_index:
+        device = candidate_by_index[default_input]
+        logging.info("Selected system default input device: %s (%s)", default_input, device["name"])
+        return int(default_input)
 
-    if not measurements:
-        raise RuntimeError("No audio input device supports the configured recording format")
-    if default_measurement:
-        level, index, name = default_measurement
-        logging.info("Selected system default input device: %s (%s)", index, name)
-    else:
-        level, index, name = max(measurements)
-    logging.info("Selected loudest input device: %s (%s), %.1f dBFS", index, name, 20 * np.log10(max(level, 1e-12)))
+    index, device = candidates[0]
+    logging.warning("System default input is unavailable; using %s (%s)", index, device["name"])
     return index
 
 
@@ -195,6 +179,7 @@ def record_once(force_auto_device: bool = False) -> None:
     written = 0
 
     try:
+        touch_heartbeat()
         device = recording_device(force_auto_device)
         logging.info("Starting recorder with device=%s", device)
         with sd.InputStream(
@@ -208,8 +193,9 @@ def record_once(force_auto_device: bool = False) -> None:
             final_path, partial_path, writer = open_segment(started_at)
             stream_stopped = False
             while not STOP or not audio_queue.empty():
-                if RESTART_REQUEST_PATH.exists():
+                if RESTART_REQUEST_PATH.exists() or STOP_REQUEST_PATH.exists():
                     RESTART_REQUEST_PATH.unlink(missing_ok=True)
+                    STOP_REQUEST_PATH.unlink(missing_ok=True)
                     STOP = True
                 if STOP and not stream_stopped:
                     # Stop callbacks first, then drain blocks already accepted by the queue.
@@ -257,6 +243,8 @@ def record_once(force_auto_device: bool = False) -> None:
 def main() -> None:
     global STOP
     install_windows_shutdown_handler()
+    STOP_REQUEST_PATH.unlink(missing_ok=True)
+    touch_heartbeat()
     retry_delay = 2
     force_auto_device = False
     while not STOP:
@@ -273,7 +261,14 @@ def main() -> None:
         if STOP:
             break
         logging.info("Retrying recorder in %s seconds", retry_delay)
-        time.sleep(retry_delay)
+        retry_until = time.monotonic() + retry_delay
+        while not STOP and time.monotonic() < retry_until:
+            if STOP_REQUEST_PATH.exists():
+                STOP_REQUEST_PATH.unlink(missing_ok=True)
+                STOP = True
+                break
+            touch_heartbeat()
+            time.sleep(min(1, retry_until - time.monotonic()))
         retry_delay = min(retry_delay * 2, 30)
 
 

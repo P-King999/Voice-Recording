@@ -14,7 +14,16 @@ import requests
 
 from config import ROOT, settings
 from health import snapshot
-from storage import connect, get_period_summary, init_db, period_transcript
+from storage import (
+    connect,
+    feishu_archive_segments,
+    feishu_daily_document,
+    get_period_summary,
+    init_db,
+    period_transcript,
+    save_feishu_daily_document,
+    save_feishu_record_ids,
+)
 
 
 RUNTIME_DIR = ROOT / "runtime"
@@ -115,8 +124,20 @@ def _period_summary(period_type: str, start: datetime, end: datetime, label: str
         return f"{label}已有 {source_count} 个可用逐字稿分段，但摘要生成失败：{exc}", None
 
 
-def report_summary_window(now: datetime) -> tuple[str, datetime, datetime]:
+def report_summary_window(now: datetime, scheduled_time: clock_time | None = None) -> tuple[str, datetime, datetime]:
+    """Choose a report window.
+
+    Scheduled reports use their configured trigger time, rather than the few
+    seconds later when the polling loop happens to run. Ad-hoc reports retain
+    the current-time behavior used by the mail-query feature.
+    """
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if scheduled_time is not None:
+        if scheduled_time < clock_time(17):
+            return "morning", day_start, day_start + timedelta(hours=12)
+        if scheduled_time < clock_time(21):
+            return "afternoon", day_start + timedelta(hours=12), day_start + timedelta(hours=17)
+        return "day", day_start, day_start + timedelta(hours=21)
     if now.time() < clock_time(12, 10):
         return "morning", day_start, day_start + timedelta(hours=12)
     if now.time() < clock_time(17, 10):
@@ -126,9 +147,9 @@ def report_summary_window(now: datetime) -> tuple[str, datetime, datetime]:
     return "day", day_start, day_start + timedelta(hours=21)
 
 
-def build_report(now: datetime | None = None) -> tuple[str, str]:
+def build_report(now: datetime | None = None, scheduled_time: clock_time | None = None) -> tuple[str, str]:
     now = now or datetime.now().astimezone()
-    summary_type, report_start, report_end = report_summary_window(now)
+    summary_type, report_start, report_end = report_summary_window(now, scheduled_time)
     period_labels = {"morning": "本日上午", "afternoon": "本日下午", "evening": "本日晚上", "day": "本日"}
     period_label = period_labels[summary_type]
     period_heading = f"{period_label}录音（{report_start:%H:%M}-{report_end:%H:%M}）"
@@ -221,9 +242,49 @@ def send_pushplus(subject: str, body: str) -> None:
         raise RuntimeError(f"PushPlus rejected the report: {response.text}")
 
 
-def deliver_report() -> None:
-    subject, body = build_report()
-    handlers = {"smtp": send_smtp, "wecom": send_wecom, "pushplus": send_pushplus}
+def send_feishu(subject: str, body: str) -> None:
+    from feishu import append_daily_document, chat_id_for_name, create_daily_document, report_card, sync_bitable_archive, tenant_access_token
+
+    token = tenant_access_token(settings.feishu_app_id, settings.feishu_app_secret)
+    created = sync_bitable_archive(
+        token, settings.feishu_bitable_app_token, settings.feishu_bitable_table_id, feishu_archive_segments()
+    )
+    save_feishu_record_ids(created)
+    now = datetime.now().astimezone()
+    day = now.date().isoformat()
+    document = feishu_daily_document(day)
+    if document:
+        document_id, document_url = str(document["document_id"]), str(document["document_url"])
+    else:
+        document_id, document_url = create_daily_document(token, f"录音日报 - {day}")
+        save_feishu_daily_document(day, document_id, document_url)
+    append_daily_document(token, document_id, subject, body)
+    chat_id = chat_id_for_name(token, settings.feishu_chat_name)
+    card = report_card(subject, body)
+    card["elements"].append(
+        {
+            "tag": "action",
+            "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "浏览录音档案"}, "type": "primary", "url": f"https://feishu.cn/base/{settings.feishu_bitable_app_token}"},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "打开今日日报"}, "type": "default", "url": document_url},
+            ],
+        }
+    )
+    from feishu import _api_request
+
+    _api_request(
+        token,
+        "POST",
+        "/im/v1/messages",
+        "send Feishu report",
+        params={"receive_id_type": "chat_id"},
+        json={"receive_id": chat_id, "msg_type": "interactive", "content": json.dumps(card, ensure_ascii=False)},
+    )
+
+
+def deliver_report(scheduled_time: clock_time | None = None) -> None:
+    subject, body = build_report(scheduled_time=scheduled_time)
+    handlers = {"smtp": send_smtp, "wecom": send_wecom, "pushplus": send_pushplus, "feishu": send_feishu}
     errors: list[str] = []
     for channel in settings.report_channels:
         handler = handlers.get(channel)
@@ -240,8 +301,8 @@ def deliver_report() -> None:
         raise RuntimeError("; ".join(errors))
 
 
-def due_schedule(now: datetime, state: dict[str, str]) -> str | None:
-    latest_key: str | None = None
+def due_schedule(now: datetime, state: dict[str, str]) -> tuple[str, clock_time] | None:
+    latest: tuple[str, clock_time] | None = None
     latest_time: clock_time | None = None
     for scheduled in settings.report_times:
         try:
@@ -251,16 +312,31 @@ def due_schedule(now: datetime, state: dict[str, str]) -> str | None:
             continue
         report_key = f"{now.date().isoformat()}-{scheduled}"
         if now.time() >= scheduled_time and (latest_time is None or scheduled_time > latest_time):
-            latest_key, latest_time = report_key, scheduled_time
-    return latest_key if latest_key and state.get("last_report") != latest_key else None
+            latest, latest_time = (report_key, scheduled_time), scheduled_time
+    return latest if latest and state.get("last_report") != latest[0] else None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Send local Voice Recorder status reports.")
     parser.add_argument("--send-now", action="store_true", help="Send one report immediately.")
+    parser.add_argument("--send-feishu-test", action="store_true", help="Send a Feishu connection test without generating a report.")
+    parser.add_argument("--sync-feishu-archive", action="store_true", help="Sync local recording metadata to the configured Feishu Bitable.")
     args = parser.parse_args()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
+    if args.send_feishu_test:
+        send_feishu(
+            "录音日报机器人连接成功",
+            f"已于 {datetime.now().astimezone():%Y-%m-%d %H:%M} 完成连接测试。\n\n后续日报会按 REPORT_TIMES 自动发送到此群。",
+        )
+        return
+    if args.sync_feishu_archive:
+        from feishu import sync_bitable_archive, tenant_access_token
+
+        token = tenant_access_token(settings.feishu_app_id, settings.feishu_app_secret)
+        created = sync_bitable_archive(token, settings.feishu_bitable_app_token, settings.feishu_bitable_table_id, feishu_archive_segments())
+        save_feishu_record_ids(created)
+        return
     if args.send_now:
         deliver_report()
         return
@@ -269,10 +345,11 @@ def main() -> None:
     while True:
         if settings.report_enabled:
             now = datetime.now().astimezone()
-            report_key = due_schedule(now, state)
-            if report_key:
+            due = due_schedule(now, state)
+            if due:
+                report_key, scheduled_time = due
                 try:
-                    deliver_report()
+                    deliver_report(scheduled_time)
                 except Exception:
                     logging.exception("Scheduled report was not delivered")
                 state["last_report"] = report_key

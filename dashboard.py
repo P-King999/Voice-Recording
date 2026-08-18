@@ -988,17 +988,28 @@ with settings_tab:
         dashboard_password = model_cols[1].text_input("看板访问密码", value=env_value("DASHBOARD_PASSWORD"), type="default" if reveal_secrets else "password")
         warning_gb = st.number_input("磁盘警告阈值（GB）", min_value=1.0, value=float(env_value("DISK_WARNING_GB") or settings.disk_warning_gb), step=1.0)
         st.divider()
-        st.subheader("邮件日报与查询")
-        st.caption("QQ 邮箱的 SMTP/IMAP 服务均需开启，并使用授权码，不要填写 QQ 登录密码。保存后请重启后台服务。")
-        report_enabled = st.checkbox("启用定时邮件日报", value=(env_value("REPORT_ENABLED") or str(settings.report_enabled)).lower() == "true")
+        st.subheader("日报与通知")
+        st.caption("可同时发送到 QQ 邮箱、企业微信、PushPlus 或飞书机器人。QQ 邮箱的 SMTP/IMAP 服务需使用授权码，不要填写 QQ 登录密码。保存后请重启后台服务。")
+        report_enabled = st.checkbox("启用定时日报", value=(env_value("REPORT_ENABLED") or str(settings.report_enabled)).lower() == "true")
         report_cols = st.columns(2)
         report_times = report_cols[0].text_input("日报发送时间（24 小时制，逗号分隔）", value=env_value("REPORT_TIMES") or ",".join(settings.report_times), placeholder="12:10,18:10")
         report_recipient = report_cols[1].text_input("接收邮箱", value=env_value("REPORT_EMAIL_RECIPIENT") or settings.report_email_recipient)
+        report_channels = st.multiselect(
+            "发送渠道",
+            ["smtp", "wecom", "pushplus", "feishu"],
+            default=list(settings.report_channels),
+            format_func={"smtp": "QQ 邮箱", "wecom": "企业微信机器人", "pushplus": "PushPlus", "feishu": "飞书机器人"}.get,
+        )
         smtp_cols = st.columns(3)
         smtp_username = smtp_cols[0].text_input("QQ 邮箱账号", value=env_value("REPORT_SMTP_USERNAME") or settings.report_smtp_username, placeholder="name@qq.com")
         smtp_host = smtp_cols[1].text_input("SMTP 服务器", value=env_value("REPORT_SMTP_HOST") or settings.report_smtp_host)
         smtp_port = smtp_cols[2].number_input("SMTP 端口", min_value=1, max_value=65535, value=int(env_value("REPORT_SMTP_PORT") or settings.report_smtp_port), step=1)
         smtp_auth_code = st.text_input("QQ 邮箱 SMTP 授权码", value=env_value("REPORT_SMTP_AUTH_CODE"), type="password", help="在 QQ 邮箱设置中开启 SMTP 后生成；不会以明文显示。")
+        st.markdown("**飞书机器人**")
+        feishu_cols = st.columns(2)
+        feishu_app_id = feishu_cols[0].text_input("飞书 App ID", value=env_value("FEISHU_APP_ID"), type="default" if reveal_secrets else "password")
+        feishu_chat_name = feishu_cols[1].text_input("飞书通知群名称", value=env_value("FEISHU_CHAT_NAME"), placeholder="录音日报")
+        feishu_app_secret = st.text_input("飞书 App Secret", value=env_value("FEISHU_APP_SECRET"), type="default" if reveal_secrets else "password")
         st.markdown("**邮件查询方式**：从上述 QQ 邮箱给自己发送任意邮件，系统会回复当前报告；在主题或正文写 `2026-08-12` 或 `2026年8月12日`，会回复对应日期的历史报告。系统只处理该邮箱自己发给自己的邮件，自动日报不会触发回复。")
         query_cols = st.columns(3)
         report_query_enabled = query_cols[0].checkbox("启用收件查询", value=(env_value("REPORT_QUERY_ENABLED") or str(settings.report_query_enabled)).lower() == "true")
@@ -1013,9 +1024,11 @@ with settings_tab:
             "MIN_ACTIVE_SECONDS": str(active_seconds), "DEFAULT_SUMMARY_MODE": summary_mode,
             "DASHBOARD_PASSWORD": dashboard_password, "DISK_WARNING_GB": str(warning_gb),
             "REPORT_ENABLED": str(report_enabled).lower(), "REPORT_TIMES": report_times.strip(),
-            "REPORT_CHANNELS": "smtp", "REPORT_EMAIL_RECIPIENT": report_recipient.strip(),
+            "REPORT_CHANNELS": ",".join(report_channels), "REPORT_EMAIL_RECIPIENT": report_recipient.strip(),
             "REPORT_SMTP_USERNAME": smtp_username.strip(), "REPORT_SMTP_HOST": smtp_host.strip(),
             "REPORT_SMTP_PORT": str(int(smtp_port)), "REPORT_SMTP_AUTH_CODE": smtp_auth_code.strip(),
+            "FEISHU_APP_ID": feishu_app_id.strip(), "FEISHU_APP_SECRET": feishu_app_secret.strip(),
+            "FEISHU_CHAT_NAME": feishu_chat_name.strip(),
             "REPORT_QUERY_ENABLED": str(report_query_enabled).lower(), "REPORT_IMAP_HOST": imap_host.strip(),
             "REPORT_IMAP_PORT": str(int(imap_port)), "REPORT_QUERY_INTERVAL_SECONDS": str(int(query_interval)),
         }

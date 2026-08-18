@@ -127,6 +127,7 @@ class Settings:
     llm_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "deepseek-chat")
     dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "")
+    dashboard_bind_address: str = os.getenv("DASHBOARD_BIND_ADDRESS", "127.0.0.1").strip() or "127.0.0.1"
     disk_warning_gb: float = float(os.getenv("DISK_WARNING_GB", "10"))
     report_enabled: bool = os.getenv("REPORT_ENABLED", "false").lower() == "true"
     report_times: tuple[str, ...] = tuple(
@@ -135,13 +136,18 @@ class Settings:
     report_channels: tuple[str, ...] = tuple(
         value.strip().lower() for value in os.getenv("REPORT_CHANNELS", "smtp").split(",") if value.strip()
     )
-    report_email_recipient: str = os.getenv("REPORT_EMAIL_RECIPIENT", "sp.99@qq.com").strip()
+    report_email_recipient: str = os.getenv("REPORT_EMAIL_RECIPIENT", "").strip()
     report_smtp_host: str = os.getenv("REPORT_SMTP_HOST", "smtp.qq.com").strip()
     report_smtp_port: int = env_int("REPORT_SMTP_PORT", 465)
     report_smtp_username: str = os.getenv("REPORT_SMTP_USERNAME", "").strip()
     report_smtp_auth_code: str = os.getenv("REPORT_SMTP_AUTH_CODE", "").strip()
     report_wecom_webhook: str = os.getenv("REPORT_WECOM_WEBHOOK", "").strip()
     report_pushplus_token: str = os.getenv("REPORT_PUSHPLUS_TOKEN", "").strip()
+    feishu_app_id: str = os.getenv("FEISHU_APP_ID", "").strip()
+    feishu_app_secret: str = os.getenv("FEISHU_APP_SECRET", "").strip()
+    feishu_chat_name: str = os.getenv("FEISHU_CHAT_NAME", "").strip()
+    feishu_bitable_app_token: str = os.getenv("FEISHU_BITABLE_APP_TOKEN", "").strip()
+    feishu_bitable_table_id: str = os.getenv("FEISHU_BITABLE_TABLE_ID", "").strip()
     report_query_enabled: bool = os.getenv("REPORT_QUERY_ENABLED", "true").lower() == "true"
     report_imap_host: str = os.getenv("REPORT_IMAP_HOST", "imap.qq.com").strip()
     report_imap_port: int = env_int("REPORT_IMAP_PORT", 993)

@@ -85,6 +85,7 @@ def init_db() -> None:
             "notes": "TEXT",
             "excitement_rating": "INTEGER NOT NULL DEFAULT 1",
             "speaker_aliases": "TEXT NOT NULL DEFAULT '{}'",
+            "feishu_record_id": "TEXT",
         }.items():
             if column not in columns:
                 conn.execute(f"ALTER TABLE segments ADD COLUMN {column} {definition}")
@@ -161,6 +162,16 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feishu_daily_documents (
+                day TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                document_url TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def add_segment(path: Path, recorded_at: datetime, duration_seconds: float, status: str = "queued") -> None:
@@ -181,6 +192,44 @@ def update_segment(segment_id: int, **fields: object) -> None:
     assignments = ", ".join(f"{key} = ?" for key in fields)
     with transaction() as conn:
         conn.execute(f"UPDATE segments SET {assignments} WHERE id = ?", [*fields.values(), segment_id])
+
+
+def feishu_archive_segments() -> list[sqlite3.Row]:
+    """Return the local archive fields that are safe to project into Feishu."""
+    with transaction() as conn:
+        return conn.execute(
+            """SELECT id, path, recorded_at, duration_seconds, active_seconds, status, transcript,
+                      conversation_analysis, summary, tags, favorite, notes, excitement_rating,
+                      feishu_record_id
+               FROM segments ORDER BY recorded_at"""
+        ).fetchall()
+
+
+def save_feishu_record_ids(records: list[tuple[str, int]]) -> None:
+    if not records:
+        return
+    timestamp = now()
+    with transaction() as conn:
+        conn.executemany(
+            "UPDATE segments SET feishu_record_id = ?, updated_at = ? WHERE id = ?",
+            [(record_id, timestamp, segment_id) for record_id, segment_id in records],
+        )
+
+
+def feishu_daily_document(day: str) -> sqlite3.Row | None:
+    with transaction() as conn:
+        return conn.execute("SELECT * FROM feishu_daily_documents WHERE day = ?", (day,)).fetchone()
+
+
+def save_feishu_daily_document(day: str, document_id: str, document_url: str) -> None:
+    with transaction() as conn:
+        conn.execute(
+            """INSERT INTO feishu_daily_documents (day, document_id, document_url, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(day) DO UPDATE SET document_id = excluded.document_id,
+                                             document_url = excluded.document_url""",
+            (day, document_id, document_url, now()),
+        )
 
 
 def claim_segments(owner: str | None = None, limit: int = 20, lease_seconds: int = 1800) -> list[sqlite3.Row]:

@@ -18,7 +18,7 @@ Windows 笔记本用的后台录音系统。它持续录制麦克风，每小时
 - 对话分析会生成标题、摘要、人物/事件、待办和 1-5 星重要程度；可重跑分析、修改说话人显示名，并查看历史汇总版本。
 - 可设置看板密码、编辑本地 `.env` 配置，并在保存后重启后台服务。
 - 定时日报支持 QQ 邮箱 SMTP、企业微信机器人和 PushPlus；可通过 QQ 邮箱向自身发信查询当前或指定日期的报告。
-- 全部服务后台运行，带登录自启、防自动休眠，以及电池供电时自动切换 Windows 节能模式。
+- 统一的后台 Agent 守护所有服务：异常服务会按退避策略重启、单个服务频繁失败会停止重启并记录日志；带登录自启、防自动休眠，以及电池供电时自动切换 Windows 节能模式。
 
 ## 从零部署
 
@@ -61,7 +61,7 @@ Copy-Item .env.example .env
 
 ### 4. 后台启动
 
-双击 `Launch-VoiceRecorder.vbs`。它不会打开命令行窗口，而是在后台启动录音、录音看门狗、转写处理、时段汇总调度、阻止自动休眠、电源管理、网页面板、日报和邮件查询服务。
+双击 `Launch-VoiceRecorder.vbs`。它不会打开命令行窗口，而是启动唯一的 Voice Recorder Agent；Agent 负责录音、转写处理、时段汇总调度、阻止自动休眠、电源管理、网页面板、日报和邮件查询服务。Agent 会为异常退出的服务采用逐步延长的重启间隔；十分钟内连续失败超过五次的服务会停止重启，需查看 `runtime/agent.log` 后手动重启。
 
 打开浏览器访问 `http://localhost:8501`，或双击 `Open-Dashboard.cmd`。页面只负责展示，关闭浏览器不会停止录音。
 
@@ -77,7 +77,7 @@ Copy-Item .env.example .env
 
 确保手机和这台电脑连接到同一个 Wi-Fi，然后在手机浏览器输入电脑的 WLAN IPv4 地址和端口，例如 `http://10.105.45.63:8501`。可用 `ipconfig` 查看当前 WLAN 的 IPv4 地址；它在网络变化后可能改变。
 
-该防火墙规则只允许专用（Private）网络访问 TCP `8501`。如果当前 Wi-Fi 被 Windows 标记为公用网络，请先在 Windows 网络设置中将该 Wi-Fi 改为专用网络。
+默认看板只监听本机 `127.0.0.1`。该脚本会将监听地址改为 `0.0.0.0`，并仅允许专用（Private）网络访问 TCP `8501`。如果当前 Wi-Fi 被 Windows 标记为公用网络，请先在 Windows 网络设置中将该 Wi-Fi 改为专用网络。完成后重启录音器使设置生效。
 
 ### 5. 开机后自动启动（可选）
 
@@ -87,7 +87,7 @@ Copy-Item .env.example .env
 .\Install-AutoStart.ps1
 ```
 
-该命令只为当前 Windows 用户添加登录自启。若不再需要，执行：
+该命令会为当前 Windows 用户配置两条独立的登录自启路径：任务计划程序会在登录 30 秒后启动、失败时最多重试 3 次；注册表启动项作为备用。两者都会先检查现有服务，因此不会重复运行。若不再需要，执行：
 
 ```powershell
 .\Uninstall-AutoStart.ps1
@@ -127,9 +127,25 @@ Copy-Item .env.example .env
 
 `summary_scheduler.py` 会随录音器启动：每天 `12:00`、`17:00`、`21:00` 会先封存当前录音片段，然后分别保存上午、下午、晚上和本日汇总；每周日 21:00 另保存本周汇总。服务启动时会补查最近 7 天已结束但尚未汇总的时段。每个时段有数据库任务记录，因此补查和正常定时运行都不会重复生成；仍在排队或转写的片段会等待处理完成，没有有效逐字稿时会保存“空”。默认在时段结束 30 秒后开始汇总；可用 `SUMMARY_FINALIZE_DELAY_SECONDS`、`SUMMARY_SCHEDULER_INTERVAL_SECONDS` 和 `SUMMARY_LOOKBACK_DAYS` 调整延迟、检查间隔和补查天数。
 
-`reporter.py` 会在汇总完成后发送已保存的结果。将 `.env` 中的 `REPORT_ENABLED` 设为 `true`，并用 `REPORT_TIMES` 配置每日发送时间，默认 `12:10,17:10,21:10`。报告包含对应时段的录音、静音/转写状态、服务健康度、磁盘容量和内容摘要。
+`reporter.py` 会在汇总完成后发送已保存的结果。将 `.env` 中的 `REPORT_ENABLED` 设为 `true`，并用 `REPORT_TIMES` 配置每日发送时间，默认 `12:10,17:10,21:10`。定时点在 `12:00-16:59`、`17:00-20:59`、`21:00` 以后时，报告分别固定为上午、下午和本日汇总；轮询的执行延迟不会改变报告范围。报告包含对应时段的录音、静音/转写状态、服务健康度、磁盘容量和内容摘要。
 
 QQ 邮箱 SMTP 需配置 `REPORT_SMTP_USERNAME`、`REPORT_SMTP_AUTH_CODE` 和收件人 `REPORT_EMAIL_RECIPIENT`。`REPORT_SMTP_AUTH_CODE` 必须是 QQ 邮箱 SMTP 授权码，不是登录密码。也可以把 `REPORT_CHANNELS` 设为 `wecom` 并配置企业微信机器人 Webhook，或设为 `pushplus` 并配置 PushPlus Token。个人微信没有稳定的官方机器人接口，不支持直接向个人微信发送。
+
+飞书自建应用机器人可将 `REPORT_CHANNELS` 设为 `feishu`（也可与其他渠道逗号组合）。在 `.env` 中配置 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和机器人已加入的唯一群名 `FEISHU_CHAT_NAME`。应用需要以应用身份发送消息、读取群聊、创建/编辑云文档，以及使用多维表格的权限。可执行以下命令发送连接测试；该命令不会生成摘要或发送其他渠道：
+
+```powershell
+.\.venv\Scripts\python.exe reporter.py --send-feishu-test
+```
+
+飞书会以卡片形式接收定时日报。
+
+要同步录音档案，在 `.env` 增加 `FEISHU_BITABLE_APP_TOKEN` 和 `FEISHU_BITABLE_TABLE_ID`。首次执行下列命令时，程序会在空表中建立归档字段，并把本地记录同步过去；之后每次飞书日报都会增量更新：
+
+```powershell
+.\.venv\Scripts\python.exe reporter.py --sync-feishu-archive
+```
+
+飞书日报会在当天首次发送时创建云文档，后续时段报告追加到同一份文档，卡片提供档案和日报入口。
 
 ## QQ 邮箱查询
 
@@ -139,23 +155,7 @@ QQ 邮箱 SMTP 需配置 `REPORT_SMTP_USERNAME`、`REPORT_SMTP_AUTH_CODE` 和收
 
 `power_manager.py` 会在电池供电时切换 Windows 节能模式，接通电源后恢复原先的电源计划。该设置仅影响电源计划，不会自动关机。
 
-需要每天定时关机时，以管理员身份运行 PowerShell 后执行以下命令；默认每天 `21:00` 关机，开始关机前会倒计时 60 秒，便于当前录音片段写入完成：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Configure-ScheduledPower.ps1
-```
-
-可指定时间，例如：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Configure-ScheduledPower.ps1 -ShutdownTime 21:30
-```
-
-移除定时任务：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Remove-ScheduledPower.ps1
-```
+项目不会配置自动关机、重启或注销账户。运行 `Configure-ScheduledPower.ps1` 会删除旧版本留下的 Voice Recorder 电源计划任务。
 
 ## 数据位置
 
