@@ -75,6 +75,28 @@ class AgentTests(unittest.TestCase):
         stop_service.assert_called_once_with(recorder, timeout=agent.RECORDER_STOP_TIMEOUT_SECONDS)
         self.assertIsNone(recorder.process)
 
+    def test_dashboard_restart_request_stops_only_the_dashboard(self) -> None:
+        dashboard = self.instance.services["dashboard"]
+        dashboard.process = FakeProcess()  # type: ignore[assignment]
+        (self.instance.runtime_dir / "dashboard.restart").touch()
+
+        with patch.object(self.instance, "stop_service") as stop_service:
+            self.instance.handle_dashboard_restart_request()
+
+        stop_service.assert_called_once_with(dashboard)
+        self.assertIsNone(dashboard.process)
+        self.assertFalse((self.instance.runtime_dir / "dashboard.restart").exists())
+
+    def test_dashboard_start_reads_the_current_bind_address_from_env(self) -> None:
+        (self.root / ".env").write_text("DASHBOARD_BIND_ADDRESS=0.0.0.0\n", encoding="utf-8")
+        dashboard = self.instance.services["dashboard"]
+
+        with patch.object(agent.subprocess, "Popen", return_value=FakeProcess()) as popen:
+            self.instance.start_service(dashboard)
+
+        command = popen.call_args.args[0]
+        self.assertIn("--server.address=0.0.0.0", command)
+
 
 if __name__ == "__main__":
     unittest.main()

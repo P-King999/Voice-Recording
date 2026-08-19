@@ -52,20 +52,38 @@ def service_specs(runtime_dir: Path = RUNTIME_DIR) -> tuple[ServiceSpec, ...]:
         ServiceSpec("power_manager", ("power_manager.py",)),
         ServiceSpec(
             "dashboard",
-            (
-                "-m",
-                "streamlit",
-                "run",
-                "dashboard.py",
-                "--server.headless=true",
-                f"--server.address={settings.dashboard_bind_address}",
-                "--server.port=8501",
-                "--browser.gatherUsageStats=false",
-            ),
+            dashboard_arguments(settings.dashboard_bind_address),
         ),
         ServiceSpec("reporter", ("reporter.py",)),
         ServiceSpec("mail_query", ("mail_query.py",)),
     )
+
+
+def dashboard_arguments(bind_address: str) -> tuple[str, ...]:
+    return (
+        "-m",
+        "streamlit",
+        "run",
+        "dashboard.py",
+        "--server.headless=true",
+        f"--server.address={bind_address}",
+        "--server.port=8501",
+        "--browser.gatherUsageStats=false",
+    )
+
+
+def configured_dashboard_bind_address(root: Path) -> str:
+    """Read the current bind address so a dashboard-only restart uses saved settings."""
+    env_path = root / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip() == "DASHBOARD_BIND_ADDRESS":
+                return value.strip().strip('"').strip("'") or "127.0.0.1"
+    return settings.dashboard_bind_address
 
 
 class VoiceRecorderAgent:
@@ -151,7 +169,12 @@ class VoiceRecorderAgent:
 
     def start_service(self, service: ManagedService) -> None:
         service.spec.heartbeat_path and service.spec.heartbeat_path.unlink(missing_ok=True)
-        command = [sys.executable, *service.spec.arguments]
+        arguments = (
+            dashboard_arguments(configured_dashboard_bind_address(self.root))
+            if service.spec.name == "dashboard"
+            else service.spec.arguments
+        )
+        command = [sys.executable, *arguments]
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         process = subprocess.Popen(command, cwd=self.root, creationflags=creation_flags)
         if self.job_handle is not None and os.name == "nt":
@@ -210,7 +233,23 @@ class VoiceRecorderAgent:
                 process.kill()
             process.wait(timeout=5)
 
+    def handle_dashboard_restart_request(self) -> None:
+        request_path = self.runtime_dir / "dashboard.restart"
+        if not request_path.exists():
+            return
+        request_path.unlink(missing_ok=True)
+        dashboard = self.services.get("dashboard")
+        if dashboard is None or dashboard.disabled:
+            return
+        logging.info("Restarting dashboard to apply updated settings")
+        self.stop_service(dashboard)
+        dashboard.process = None
+        dashboard.started_at = 0.0
+        self.pid_path("dashboard").unlink(missing_ok=True)
+        dashboard.next_start_at = 0.0
+
     def supervise_once(self) -> None:
+        self.handle_dashboard_restart_request()
         now = time.monotonic()
         for service in self.services.values():
             process = service.process
@@ -243,6 +282,7 @@ class VoiceRecorderAgent:
         self.create_process_job()
         STOP_REQUEST_PATH.unlink(missing_ok=True)
         RECORDER_STOP_REQUEST_PATH.unlink(missing_ok=True)
+        (self.runtime_dir / "dashboard.restart").unlink(missing_ok=True)
         self.pid_path("agent").write_text(str(os.getpid()), encoding="utf-8")
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)

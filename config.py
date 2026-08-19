@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import os
+import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +15,7 @@ RECORDINGS_DIR = DATA_DIR / "recordings"
 SILENT_DIR = DATA_DIR / "silent"
 FAILED_DIR = DATA_DIR / "failed"
 DB_PATH = DATA_DIR / "voice_recorder.sqlite3"
+_ENV_WRITE_LOCK = threading.Lock()
 
 
 def load_dotenv() -> None:
@@ -40,6 +44,29 @@ def load_secret_file(env_name: str, filename: str) -> None:
             os.environ[env_name] = value
 
 
+def _persist_env_document(env_path: Path, content: str) -> None:
+    """Write .env safely on Windows, where replacing a briefly-open file can fail."""
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_fd, temporary_name = tempfile.mkstemp(prefix=f".{env_path.name}.", suffix=".tmp", dir=env_path.parent)
+    os.close(temporary_fd)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        with _ENV_WRITE_LOCK:
+            for attempt in range(8):
+                try:
+                    temporary.replace(env_path)
+                    return
+                except PermissionError:
+                    if attempt == 7:
+                        # Some Windows file locks deny rename/delete but still allow writing in place.
+                        env_path.write_text(content, encoding="utf-8")
+                        return
+                    time.sleep(0.15)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def save_env_value(key: str, value: str) -> None:
     """Persist a user-controlled setting while preserving comments in .env."""
     env_path = ROOT / ".env"
@@ -52,9 +79,7 @@ def save_env_value(key: str, value: str) -> None:
             break
     else:
         lines.extend(["", replacement])
-    temporary = env_path.with_suffix(".tmp")
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    temporary.replace(env_path)
+    _persist_env_document(env_path, "\n".join(lines) + "\n")
 
 
 def read_env_document() -> str:
@@ -72,9 +97,7 @@ def save_env_document(content: str) -> None:
         if stripped and not stripped.startswith("#") and "=" not in stripped:
             raise ValueError(f"第 {line_number} 行缺少 = 号。")
     env_path = ROOT / ".env"
-    temporary = env_path.with_suffix(".tmp")
-    temporary.write_text(content.rstrip() + "\n", encoding="utf-8")
-    temporary.replace(env_path)
+    _persist_env_document(env_path, content.rstrip() + "\n")
 
 
 load_dotenv()

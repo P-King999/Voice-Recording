@@ -2,6 +2,8 @@
 __pycache__/
 data/
 runtime/
+build/
+dist/
 .env
 AccessKey.csv
 deepseekkey.txt

@@ -298,6 +298,18 @@ def render_transcript(record: object, speaker_names: dict[str, str], widget_pref
             )
 
 
+def pending_playback_start(record_id: int) -> float | None:
+    """Consume a sentence playback request for this recording, if one exists."""
+    pending = st.session_state.get("pending_playback")
+    if not isinstance(pending, dict) or pending.get("record_id") != record_id:
+        return None
+    st.session_state.pop("pending_playback", None)
+    try:
+        return max(0, float(pending["start_seconds"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def text_value(value: object, fallback: str = "记录不充分") -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
 
@@ -603,6 +615,13 @@ def restart_recorder(device_choice: str) -> None:
         raise RuntimeError("录音器启动失败，请查看 runtime/recorder.error.log。")
 
 
+def request_dashboard_restart() -> None:
+    """Ask the agent to restart only the dashboard after its response is sent."""
+    runtime_dir = ROOT / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "dashboard.restart").touch()
+
+
 def render_live_recording() -> None:
     active = active_recordings()
     if active:
@@ -662,7 +681,13 @@ def render_record_detail(record: dict[str, object], widget_prefix: str) -> None:
         with left:
             audio_path = Path(str(record["path"]))
             if audio_path.exists():
-                st.audio(str(audio_path), format="audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav")
+                start_seconds = pending_playback_start(int(record["id"]))
+                st.audio(
+                    str(audio_path),
+                    format="audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav",
+                    start_time=start_seconds or 0,
+                    autoplay=start_seconds is not None,
+                )
             st.caption(f"响度：{record['dbfs']:.1f} dBFS" if record["dbfs"] is not None else "等待音频分析")
         with right:
             if record["transcript"]:
@@ -986,6 +1011,12 @@ with settings_tab:
         model_cols = st.columns(2)
         summary_mode = model_cols[0].selectbox("默认汇总模型", list(SUMMARY_MODE_LABELS), index=list(SUMMARY_MODE_LABELS).index(env_value("DEFAULT_SUMMARY_MODE") or settings.default_summary_mode), format_func=lambda value: SUMMARY_MODE_LABELS[value])
         dashboard_password = model_cols[1].text_input("看板访问密码", value=env_value("DASHBOARD_PASSWORD"), type="default" if reveal_secrets else "password")
+        dashboard_bind_address = (env_value("DASHBOARD_BIND_ADDRESS") or settings.dashboard_bind_address).strip()
+        lan_access_enabled = st.toggle(
+            "允许局域网访问看板",
+            value=dashboard_bind_address == "0.0.0.0",
+            help="开启后，同一局域网内的设备可以通过本机 IP 和端口 8501 访问看板。保存后会自动重启看板；首次开启还需允许 Windows 防火墙访问。",
+        )
         warning_gb = st.number_input("磁盘警告阈值（GB）", min_value=1.0, value=float(env_value("DISK_WARNING_GB") or settings.disk_warning_gb), step=1.0)
         st.divider()
         st.subheader("日报与通知")
@@ -1018,11 +1049,13 @@ with settings_tab:
         query_interval = st.number_input("收件查询间隔（秒）", min_value=20, value=int(env_value("REPORT_QUERY_INTERVAL_SECONDS") or settings.report_query_interval_seconds), step=10)
         save_settings = st.form_submit_button("保存全部设置")
     if save_settings:
+        new_dashboard_bind_address = "0.0.0.0" if lan_access_enabled else "127.0.0.1"
         values = {
             "DASHSCOPE_API_KEY": dashscope_key.strip(), "LLM_API_KEY": llm_key.strip(),
             "SEGMENT_SECONDS": str(int(segment_seconds)), "SILENCE_THRESHOLD_DBFS": str(silence_threshold),
             "MIN_ACTIVE_SECONDS": str(active_seconds), "DEFAULT_SUMMARY_MODE": summary_mode,
             "DASHBOARD_PASSWORD": dashboard_password, "DISK_WARNING_GB": str(warning_gb),
+            "DASHBOARD_BIND_ADDRESS": new_dashboard_bind_address,
             "REPORT_ENABLED": str(report_enabled).lower(), "REPORT_TIMES": report_times.strip(),
             "REPORT_CHANNELS": ",".join(report_channels), "REPORT_EMAIL_RECIPIENT": report_recipient.strip(),
             "REPORT_SMTP_USERNAME": smtp_username.strip(), "REPORT_SMTP_HOST": smtp_host.strip(),
@@ -1035,7 +1068,11 @@ with settings_tab:
         for key, value in values.items():
             save_env_value(key, value)
             os.environ[key] = value
-        st.success("已写入 .env。请重启后台服务以应用录音、转写和分析参数。")
+        if dashboard_bind_address != new_dashboard_bind_address:
+            request_dashboard_restart()
+            st.success("已写入 .env。看板正在自动重启以应用局域网访问设置，请在几秒后刷新页面。")
+        else:
+            st.success("已写入 .env。请重启后台服务以应用录音、转写和分析参数。")
     with st.expander("高级：编辑完整 .env 配置文档", expanded=False):
         document = st.text_area(".env", value=read_env_document(), height=360, key="env-document")
         if st.button("保存完整配置文档"):
