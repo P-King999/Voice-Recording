@@ -5,21 +5,37 @@ import json
 import hmac
 import os
 import re
-import subprocess
-import sys
-import time as time_module
+import shutil
 from datetime import datetime, time, timedelta
 from html import escape
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import soundfile as sf
 import streamlit as st
 import sounddevice as sd
 
-from config import RECORDINGS_DIR, ROOT, ensure_storage, read_env_document, save_env_document, save_env_value, settings
+from config import (
+    RECORDINGS_DIR,
+    ROOT,
+    dashboard_access_mode,
+    ensure_storage,
+    read_env_document,
+    save_env_document,
+    save_env_value,
+    settings,
+)
 from exports import markdown as export_markdown, srt as export_srt, word_html
-from health import _pid_alive, snapshot
+from health import snapshot
+from rating_templates import (
+    delete_user_template,
+    rating_instruction,
+    rating_templates,
+    resolve_template_id,
+    save_user_template,
+    template_label,
+)
 from storage import (
     dashboard_counts,
     dashboard_overview,
@@ -28,8 +44,10 @@ from storage import (
     find_dashboard_overview,
     get_period_summary,
     init_db,
+    list_segment_tags,
     list_speakers,
     period_transcript,
+    add_segment,
     summary_versions,
     update_segment,
 )
@@ -51,13 +69,14 @@ SUMMARY_MODE_LABELS = {
     "qwen_plus": "千问 Qwen Plus",
 }
 RATING_LABELS = {
-    0: "0星 无内容/未分析",
-    1: "1星 教学/讲解",
-    2: "2星 日常聊天",
-    3: "3星 人物关系/背景",
-    4: "4星 矛盾/习惯/重点内容",
-    5: "5星 超级劲爆",
+    0: "0星 无实质内容/未分析",
+    1: "1星 低优先级",
+    2: "2星 一般关注",
+    3: "3星 需要关注",
+    4: "4星 重要",
+    5: "5星 紧急/重大",
 }
+SUPPORTED_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
 
 
 def format_offset(seconds: float) -> str:
@@ -148,7 +167,7 @@ def excitement_rating(record: object, analysis: dict[str, object] | None = None)
         return 0
     value = analysis.get("excitement_rating") if analysis else record_value(record, "excitement_rating", 1)
     try:
-        return min(5, max(1, int(value)))
+        return min(5, max(0, int(value)))
     except (TypeError, ValueError):
         return 1
 
@@ -222,12 +241,13 @@ def search_records(
     statuses: tuple[str, ...],
     recorded_on: object | None,
     ratings: tuple[int, ...],
+    tags: tuple[str, ...],
     favorites_only: bool,
     newest_first: bool = True,
     page: int = 0,
 ) -> tuple[list[dict[str, object]], int]:
     records, total = find_dashboard_overview(
-        query, list(statuses), recorded_on, list(ratings), favorites_only,
+        query, list(statuses), recorded_on, list(ratings), list(tags), favorites_only,
         newest_first, limit=100, offset=max(0, page) * 100,
     )
     return [dict(record) for record in records], total
@@ -456,16 +476,42 @@ def period_details(choice: str, now: datetime) -> tuple[str, datetime, datetime,
 
 
 def require_authentication() -> None:
-    if not settings.dashboard_password:
-        st.error("看板尚未配置 DASHBOARD_PASSWORD，已拒绝访问。")
+    password = os.getenv("DASHBOARD_PASSWORD", "")
+    bind_address = (os.getenv("DASHBOARD_BIND_ADDRESS") or settings.dashboard_bind_address).strip()
+    local_no_password = os.getenv("DASHBOARD_LOCAL_NO_PASSWORD", "false").lower() == "true"
+    access_mode = dashboard_access_mode(password, bind_address, local_no_password)
+
+    if access_mode == "setup":
+        st.subheader("设置看板密码")
+        st.caption("首次使用请设置看板密码。之后可在“设置”页面修改；启用局域网访问时必须使用密码登录。")
+        with st.form("dashboard-password-setup"):
+            new_password = st.text_input("设置密码", type="password")
+            confirmed_password = st.text_input("确认密码", type="password")
+            submitted = st.form_submit_button("保存并进入登录")
+        if submitted:
+            if not new_password:
+                st.error("密码不能为空。")
+            elif new_password != confirmed_password:
+                st.error("两次输入的密码不一致。")
+            else:
+                save_env_value("DASHBOARD_PASSWORD", new_password)
+                os.environ["DASHBOARD_PASSWORD"] = new_password
+                st.session_state["dashboard_password_initialized"] = True
+                st.rerun()
         st.stop()
+
+    if access_mode == "unprotected":
+        return
+
     if st.session_state.get("authenticated"):
         return
+    if st.session_state.pop("dashboard_password_initialized", False):
+        st.success("密码已设置，请登录。")
     st.subheader("录音档案登录")
     with st.form("dashboard-login"):
-        password = st.text_input("密码", type="password")
+        entered_password = st.text_input("密码", type="password")
         submitted = st.form_submit_button("登录")
-    if submitted and hmac.compare_digest(password, settings.dashboard_password):
+    if submitted and hmac.compare_digest(entered_password, password):
         st.session_state["authenticated"] = True
         st.rerun()
     if submitted:
@@ -584,35 +630,60 @@ def microphone_test(device_choice: str) -> tuple[bytes, float]:
     return wav.getvalue(), dbfs
 
 
-def restart_recorder(device_choice: str) -> None:
-    """Ask the recorder to finish its current audio block, then start it again."""
+def request_recorder_restart() -> None:
+    """Ask the managed recorder to finish its current file and start with saved settings."""
     runtime_dir = ROOT / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    pid_path = runtime_dir / "recorder.pid"
     restart_path = runtime_dir / "recorder.restart"
+    restart_path.touch()
 
-    if _pid_alive(pid_path):
-        restart_path.touch()
-        deadline = time_module.monotonic() + 15
-        while _pid_alive(pid_path) and time_module.monotonic() < deadline:
-            time_module.sleep(0.1)
-        if _pid_alive(pid_path):
-            raise RuntimeError("录音器未能在 15 秒内停止，请稍后重试。")
 
-    pid_path.unlink(missing_ok=True)
-    restart_path.unlink(missing_ok=True)
-    environment = os.environ.copy()
-    environment["RECORDING_DEVICE"] = device_choice
-    process = subprocess.Popen(
-        [sys.executable, "recorder.py"],
-        cwd=ROOT,
-        env=environment,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    pid_path.write_text(str(process.pid), encoding="utf-8")
-    time_module.sleep(1)
-    if process.poll() is not None:
-        raise RuntimeError("录音器启动失败，请查看 runtime/recorder.error.log。")
+def recorder_is_paused() -> bool:
+    return (ROOT / "runtime" / "recorder.paused").exists()
+
+
+def set_recorder_paused(paused: bool) -> None:
+    runtime_dir = ROOT / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    pause_path = runtime_dir / "recorder.paused"
+    if paused:
+        pause_path.touch()
+    else:
+        pause_path.unlink(missing_ok=True)
+
+
+def _audio_files_at(source: Path) -> list[Path]:
+    if source.is_file():
+        return [source] if source.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES else []
+    if not source.is_dir():
+        return []
+    return [path for path in source.rglob("*") if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES]
+
+
+def import_audio_sources(source: Path) -> tuple[int, list[str]]:
+    """Copy user-selected audio into managed storage and add it to the processing queue."""
+    sources = _audio_files_at(source)
+    if not sources:
+        return 0, ["未找到支持的音频文件（WAV、MP3、FLAC、OGG、M4A、AAC、WMA）。"]
+    imported_dir = RECORDINGS_DIR / "imported"
+    imported_dir.mkdir(parents=True, exist_ok=True)
+    imported = 0
+    errors: list[str] = []
+    for audio_path in sources:
+        try:
+            try:
+                with sf.SoundFile(audio_path) as audio:
+                    duration = len(audio) / audio.samplerate
+            except RuntimeError:
+                # FFmpeg in the worker will normalize formats not supported by libsndfile.
+                duration = 0.0
+            destination = imported_dir / f"{audio_path.stem}-{uuid4().hex[:8]}{audio_path.suffix.lower()}"
+            shutil.copy2(audio_path, destination)
+            add_segment(destination, datetime.fromtimestamp(audio_path.stat().st_mtime).astimezone(), duration)
+            imported += 1
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"{audio_path.name}: {exc}")
+    return imported, errors
 
 
 def request_dashboard_restart() -> None:
@@ -730,8 +801,42 @@ def toggle_favorite(record_id: int, favorite: object) -> None:
     clear_record_caches()
 
 
+def render_first_open_guide() -> None:
+    if os.getenv("ONBOARDING_COMPLETED", "false").lower() == "true":
+        return
+    st.info("""
+### 首次使用
+1. 打开“设置”，填写 **百炼 API Key**，它用于把音频转成逐字稿；填写 **DeepSeek API Key**，它用于生成对话分析和日报。
+2. 选择麦克风，点击“测试麦克风”试听，再保存并切换。
+3. 回到首页开始录音。说几句话后暂停录音，已封存的片段会自动进入处理队列。
+
+示例：录制一段“今天项目进度是……，下周由小王跟进……”的会议内容，完成后可在“搜索与档案”查看逐字稿、人物与待办分析。
+""")
+    if st.button("我已了解，开始使用", key="finish-onboarding"):
+        save_env_value("ONBOARDING_COMPLETED", "true")
+        os.environ["ONBOARDING_COMPLETED"] = "true"
+        st.rerun()
+
+
+def render_help_page() -> None:
+    st.subheader("使用说明")
+    with st.expander("开始录音与暂停", expanded=True):
+        st.write("首页会显示录音器和处理器状态。点击暂停录音会先封存当前片段，已保存内容仍会继续转写；点击继续录音会重新打开麦克风。实时监听只用于确认麦克风输入，不会影响保存的音频。")
+    with st.expander("导入已有录音"):
+        st.write("在“搜索与档案”的导入区，可选择浏览器中的单个音频文件，或填写本机的单个文件/文件夹路径。文件夹会递归导入支持的音频。导入时会复制到应用管理的 imported 目录，原始文件不会被修改或删除。")
+    with st.expander("录音与分析设置"):
+        st.write("录音默认保存目录决定新录音和导入副本的保存位置；每段录音秒数决定自动分段长度。静音阈值和最短有效声音秒数用于过滤没有有效语音的片段。百炼负责语音转写，DeepSeek 负责对话分析、摘要和日报。")
+    with st.expander("评分模板与标签"):
+        st.write("星级从 0 到 5 星。默认“通用重要度”中，分数越高表示越重要、越需要关注，不代表内容更具娱乐性。还可选用“作者自定义模板：教学与吃瓜”、会议行动或风险模板。在设置的“管理个人评分模板”中可复制任一模板后编辑提示词，保留多个个人模板。模板仅影响之后的分析，已有录音点击“重新分析并评分”后会使用新规则。每条录音可在详情中用逗号添加标签；搜索与档案中的标签筛选支持多选。")
+    with st.expander("档案、汇总与通知"):
+        st.write("“搜索与档案”可按日期、状态、星级和关键词筛选录音，并可收藏、添加标签和备注、导出或重试。首页的时段汇总会基于已完成的逐字稿生成。日报与通知默认折叠，只有需要邮件、企业微信、PushPlus 或飞书推送时再展开配置。")
+    with st.expander("隐私与故障排查"):
+        st.write("音频、逐字稿和分析结果默认保存在本机。上传转写前请确保已取得录音授权。若转写停在等待配置，请检查百炼 API Key；若没有对话分析，请检查 DeepSeek API Key。磁盘空间不足或麦克风权限关闭也会影响录音。")
+
+
 st.title("录音档案")
-home_tab, archive_tab, settings_tab = st.tabs(["首页", "搜索与档案", "设置"])
+render_first_open_guide()
+home_tab, archive_tab, settings_tab, help_tab = st.tabs(["首页", "搜索与档案", "设置", "使用说明"])
 
 with home_tab:
     health = snapshot(ROOT)
@@ -742,6 +847,17 @@ with home_tab:
     health_cols[3].metric("处理器", "运行中" if health["services"].get("worker") else "未运行")
     if health["free_gb"] < settings.disk_warning_gb:
         st.error(f"磁盘空间不足：仅剩 {health['free_gb']:.1f} GB，请及时归档或清理录音。")
+    recording_action, recording_hint = st.columns([1, 5], vertical_alignment="center")
+    if recorder_is_paused():
+        if recording_action.button("继续录音", type="primary", key="resume-recording"):
+            set_recorder_paused(False)
+            st.rerun()
+        recording_hint.caption("录音已暂停：当前片段已封存，等待处理的录音会继续分析。")
+    else:
+        if recording_action.button("暂停录音", key="pause-recording"):
+            set_recorder_paused(True)
+            st.rerun()
+        recording_hint.caption("暂停会安全封存当前片段，不会中断已入队的转写与分析。")
     if hasattr(st, "fragment"):
         st.fragment(run_every=10)(render_live_recording)()
     else:
@@ -828,6 +944,41 @@ with home_tab:
         st.info("还没有录音片段。")
 
 with archive_tab:
+    with st.expander("导入已有录音进行分析", expanded=False):
+        st.caption("支持单个文件或本机文件夹路径，将复制副本进入管理目录并自动开始转写。原文件保持不变。")
+        source_path_text = st.text_input("本机音频文件或文件夹路径", placeholder=r"D:\\Meetings\\2026-08-20")
+        if st.button("导入此路径并开始分析", key="import-audio-path"):
+            source_path = Path(source_path_text.strip()).expanduser()
+            if not source_path_text.strip() or not source_path.exists():
+                st.error("请输入存在的本机音频文件或文件夹路径。")
+            else:
+                imported, errors = import_audio_sources(source_path)
+                if imported:
+                    clear_record_caches()
+                    st.success(f"已导入 {imported} 个音频，正在排队转写与分析。")
+                for error in errors[:5]:
+                    st.warning(error)
+        uploaded_audio = st.file_uploader("或选择单个或多个音频文件", type=[suffix[1:] for suffix in sorted(SUPPORTED_AUDIO_SUFFIXES)], accept_multiple_files=True)
+        if st.button("导入已选音频并开始分析", key="import-uploaded-audio", disabled=not uploaded_audio):
+            upload_dir = ROOT / "runtime" / "uploaded-audio"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            uploaded_sources: list[Path] = []
+            for uploaded in uploaded_audio:
+                suffix = Path(uploaded.name).suffix.lower()
+                temporary_path = upload_dir / f"{uuid4().hex}{suffix}"
+                temporary_path.write_bytes(uploaded.getvalue())
+                uploaded_sources.append(temporary_path)
+            imported, errors = 0, []
+            for uploaded_source in uploaded_sources:
+                count, source_errors = import_audio_sources(uploaded_source)
+                imported += count
+                errors.extend(source_errors)
+                uploaded_source.unlink(missing_ok=True)
+            if imported:
+                clear_record_caches()
+                st.success(f"已导入 {imported} 个音频，正在排队转写与分析。")
+            for error in errors[:5]:
+                st.warning(error)
     archive_title, favorites_action = st.columns([6, 1])
     archive_title.subheader("全部录音")
     if favorites_action.button("收藏夹", key="archive-favorites-toggle", type="secondary"):
@@ -838,19 +989,21 @@ with archive_tab:
     if st.session_state.get("archive_favorites_only", False):
         st.caption("正在显示收藏夹")
     with st.form("archive-search", border=False):
-        filter_cols = st.columns([3, 2, 2, 2, 2, 1])
+        filter_cols = st.columns([3, 1, 2, 2, 2, 2, 1])
         query = filter_cols[0].text_input("关键词", placeholder="逐字稿、人物、话题、标签或备注")
         date_enabled = filter_cols[1].checkbox("限定日期")
         filter_date = filter_cols[1].date_input("录音日期", value=datetime.now().date(), disabled=not date_enabled)
         selected_statuses = filter_cols[2].multiselect("状态", list(STATUS_LABELS), default=list(STATUS_LABELS), format_func=lambda value: STATUS_LABELS[value])
         selected_ratings = filter_cols[3].multiselect("星级", list(range(6)), default=list(range(6)), format_func=lambda value: RATING_LABELS[value])
-        sort_order = filter_cols[4].selectbox("排序", ["最近优先", "最早优先"])
-        submitted = filter_cols[5].form_submit_button("应用", use_container_width=True)
+        selected_tags = filter_cols[4].multiselect("标签", list_segment_tags(), placeholder="全部标签")
+        sort_order = filter_cols[5].selectbox("排序", ["最近优先", "最早优先"])
+        submitted = filter_cols[6].form_submit_button("应用", use_container_width=True)
     if submitted or "archive_query" not in st.session_state:
         st.session_state["archive_query"] = query
         st.session_state["archive_statuses"] = tuple(selected_statuses)
         st.session_state["archive_date"] = filter_date if date_enabled else None
         st.session_state["archive_ratings"] = tuple(selected_ratings)
+        st.session_state["archive_tags"] = tuple(selected_tags)
         st.session_state["archive_newest_first"] = sort_order == "最近优先"
         st.session_state["archive_page"] = 0
         st.session_state.pop("archive_record_id", None)
@@ -860,19 +1013,66 @@ with archive_tab:
         st.session_state["archive_statuses"],
         st.session_state["archive_date"],
         st.session_state["archive_ratings"],
+        st.session_state.get("archive_tags", ()),
         bool(st.session_state.get("archive_favorites_only", False)),
         bool(st.session_state["archive_newest_first"]),
         page,
     )
     page_size = 100
     page_count = max(1, (total_results + page_size - 1) // page_size)
-    st.caption(f"共 {total_results} 条录音，当前显示第 {page + 1} / {page_count} 页。")
+    archive_list_column, archive_detail_column = st.columns([5, 7], gap="large")
+    archive_list_scroll = archive_list_column.container(height=720, border=False)
+    archive_detail_scroll = archive_detail_column.container(height=720, border=False)
+    with archive_detail_scroll:
+        archive_record_id = st.session_state.get("archive_record_id")
+        if archive_record_id:
+            selected_record = load_record(int(archive_record_id))
+            if selected_record:
+                st.subheader(overview_title(selected_record))
+                render_record_detail(selected_record, "archive")
+            else:
+                st.info("选中的录音不存在或已被删除。")
+        else:
+            st.info("从左侧列表选择一条录音查看详情。")
+    archive_list_scroll.caption(f"共 {total_results} 条录音，当前显示第 {page + 1} / {page_count} 页。")
+    jump_date_column, jump_action_column, clear_jump_column = archive_list_scroll.columns([3, 1, 1])
+    jump_date = jump_date_column.date_input(
+        "日期跳转",
+        value=st.session_state.get("archive_date") or datetime.now().date(),
+        key="archive-jump-date",
+        help="跳转后仅显示该日期内、且符合当前搜索条件的录音。",
+    )
+    if jump_action_column.button("跳转", key="archive-jump-to-date", use_container_width=True):
+        st.session_state["archive_date"] = jump_date
+        st.session_state["archive_page"] = 0
+        st.session_state.pop("archive_record_id", None)
+        st.rerun()
+    if clear_jump_column.button(
+        "清除",
+        key="archive-clear-date-jump",
+        disabled=st.session_state.get("archive_date") is None,
+        use_container_width=True,
+    ):
+        st.session_state["archive_date"] = None
+        st.session_state["archive_page"] = 0
+        st.session_state.pop("archive_record_id", None)
+        st.rerun()
+    if st.session_state.get("archive_date"):
+        archive_list_scroll.caption(f"当前已定位至 {st.session_state['archive_date']:%Y年%m月%d日}。")
+
     if results:
         visible_results = [item for item in results if not is_empty_record(item)]
         empty_results = [item for item in results if is_empty_record(item)]
+        visible_recording_date = None
         for item in visible_results:
+            recording_at = record_recorded_at(item)
+            if recording_at.date() != visible_recording_date:
+                if visible_recording_date is not None:
+                    archive_list_scroll.divider()
+                archive_list_scroll.markdown(f"#### {recording_at:%Y年%m月%d日}")
+                visible_recording_date = recording_at.date()
             status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
-            title, timestamp, favorite_action, action = st.columns([5, 3, 1, 1])
+            title, timestamp, favorite_action, action = archive_list_scroll.columns([5, 3, 1, 1])
             title.write(overview_title(item))
             timestamp.caption(f"{rating_label(item)} · {record_recorded_at(item):%Y-%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
             if favorite_action.button("★" if item["favorite"] else "☆", key=f"archive-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
@@ -882,7 +1082,7 @@ with archive_tab:
                 st.session_state["archive_record_id"] = int(item["id"])
                 st.rerun()
         if empty_results:
-            with st.expander(f"空（{len(empty_results)} 条）", expanded=False):
+            with archive_list_scroll.expander(f"空（{len(empty_results)} 条）", expanded=False):
                 for item in empty_results:
                     status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
                     title, timestamp, favorite_action, action = st.columns([5, 3, 1, 1])
@@ -894,7 +1094,7 @@ with archive_tab:
                     if action.button("查看", key=f"archive-empty-view-{item['id']}"):
                         st.session_state["archive_record_id"] = int(item["id"])
                         st.rerun()
-        pager_left, pager_center, pager_right = st.columns([1, 4, 1])
+        pager_left, pager_center, pager_right = archive_list_scroll.columns([1, 4, 1])
         if pager_left.button("上一页", disabled=page == 0):
             st.session_state["archive_page"] = page - 1
             st.rerun()
@@ -903,15 +1103,9 @@ with archive_tab:
             st.session_state["archive_page"] = page + 1
             st.rerun()
     else:
-        st.info("没有符合条件的录音。")
-    archive_record_id = st.session_state.get("archive_record_id")
-    if archive_record_id:
-        selected_record = load_record(int(archive_record_id))
-        if selected_record:
-            st.divider()
-            render_record_detail(selected_record, "archive")
+        archive_list_scroll.info("没有符合条件的录音。")
 
-    with st.expander("批量操作", expanded=False):
+    with archive_list_scroll.expander("批量操作", expanded=False):
         selected_ids = st.multiselect(
             "选择当前结果中的录音",
             [int(item["id"]) for item in results],
@@ -940,19 +1134,19 @@ with archive_tab:
         st.download_button("导出 SRT", export_srt(selected_records), "recordings.srt", "application/x-subrip", disabled=not selected_records)
 
 with settings_tab:
-    st.subheader("录音设备与监听")
+    device_section = st.expander("录音设备与监听", expanded=True)
     device_options, device_labels = input_device_options()
     selected_device = saved_recording_device()
     if selected_device not in device_options:
         device_options.append(selected_device)
         device_labels[selected_device] = f"已保存设备：{selected_device}（当前不可用）"
-    device_choice = st.selectbox(
+    device_choice = device_section.selectbox(
         "麦克风",
         device_options,
         index=device_options.index(selected_device),
         format_func=lambda item: device_labels[item],
     )
-    device_actions = st.columns(2)
+    device_actions = device_section.columns(2)
     if device_actions[0].button("测试麦克风"):
         try:
             with st.spinner("正在录制 3 秒测试音频..."):
@@ -964,8 +1158,8 @@ with settings_tab:
             st.session_state["microphone_test_dbfs"] = dbfs
     if "microphone_test_clip" in st.session_state:
         test_dbfs = float(st.session_state["microphone_test_dbfs"])
-        st.audio(st.session_state["microphone_test_clip"], format="audio/wav")
-        st.success(f"声音测试完成：{test_dbfs:.1f} dBFS" if test_dbfs >= settings.silence_threshold_dbfs else f"声音测试完成，但音量偏低：{test_dbfs:.1f} dBFS")
+        device_section.audio(st.session_state["microphone_test_clip"], format="audio/wav")
+        device_section.success(f"声音测试完成：{test_dbfs:.1f} dBFS" if test_dbfs >= settings.silence_threshold_dbfs else f"声音测试完成，但音量偏低：{test_dbfs:.1f} dBFS")
     if device_actions[1].button("保存并切换"):
         try:
             if device_choice != "auto":
@@ -976,15 +1170,16 @@ with settings_tab:
                     dtype="float32",
                 )
             save_env_value("RECORDING_DEVICE", device_choice)
-            restart_recorder(device_choice)
+            os.environ["RECORDING_DEVICE"] = device_choice
+            request_recorder_restart()
         except Exception as exc:
             st.error(f"切换失败：{exc}")
         else:
             st.session_state["recording_device_changed"] = device_labels[device_choice]
             st.rerun()
     if changed_device := st.session_state.pop("recording_device_changed", None):
-        st.success(f"已切换到 {changed_device}，录音器已重新启动。")
-    if st.toggle("实时监听", key="live_monitor_enabled"):
+        device_section.success(f"已切换到 {changed_device}，录音器已重新启动。")
+    if device_section.toggle("实时监听", key="live_monitor_enabled"):
         if hasattr(st, "fragment"):
             st.fragment(run_every=1)(render_live_monitor)()
         else:
@@ -1000,62 +1195,141 @@ with settings_tab:
         save_env_value("DASHSCOPE_API_KEY", env_value("DASHSCOPE_API_KEY"))
         save_env_value("LLM_API_KEY", env_value("LLM_API_KEY"))
         st.success("当前已加载的 API Key 已写入 .env。确认可用后，可自行删除旧的密钥文件。")
+    st.info("在下方修改设置后，需点击底部的“保存全部设置”才会生效。")
+    available_rating_templates = rating_templates()
+    saved_rating_template = resolve_template_id(env_value("RATING_TEMPLATE") or settings.rating_template)
+    if saved_rating_template not in available_rating_templates:
+        saved_rating_template = "general"
+    with st.expander("评分与分析模板", expanded=True):
+        rating_template = st.selectbox(
+            "星级评分模板",
+            list(available_rating_templates),
+            index=list(available_rating_templates).index(saved_rating_template),
+            format_func=template_label,
+        )
+        st.text_area("当前生效的评分提示词", value=rating_instruction(rating_template), height=180, disabled=True)
+        with st.popover("管理个人评分模板", use_container_width=True):
+            if st.button("以当前模板创建个人副本", key="copy-rating-template"):
+                st.session_state["rating_template_draft_name"] = f"{template_label(rating_template)} 副本"
+                st.session_state["rating_template_draft_prompt"] = rating_instruction(rating_template, settings.rating_custom_prompt)
+                st.rerun()
+            with st.form("create-rating-template", border=False):
+                new_template_name = st.text_input("新模板名称", value=st.session_state.get("rating_template_draft_name", ""))
+                new_template_prompt = st.text_area("新模板评分提示词", value=st.session_state.get("rating_template_draft_prompt", ""), height=180)
+                create_template = st.form_submit_button("添加个人模板")
+            if create_template:
+                try:
+                    template_id = save_user_template(None, new_template_name, new_template_prompt)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["rating_template_draft_name"] = ""
+                    st.session_state["rating_template_draft_prompt"] = ""
+                    st.session_state["rating_template_created"] = template_id
+                    st.rerun()
+            personal_templates = {key: item for key, item in available_rating_templates.items() if key.startswith("user_")}
+            if personal_templates:
+                selected_personal_template = st.selectbox("编辑个人模板", list(personal_templates), format_func=template_label, key="edit-personal-rating-template")
+                current_personal = personal_templates[selected_personal_template]
+                with st.form("edit-rating-template", border=False):
+                    edited_name = st.text_input("模板名称", value=current_personal["name"])
+                    edited_prompt = st.text_area("评分提示词", value=current_personal["prompt"], height=180)
+                    save_template, remove_template = st.columns(2)
+                    save_template_clicked = save_template.form_submit_button("保存模板")
+                    remove_template_clicked = remove_template.form_submit_button("删除模板")
+                if save_template_clicked:
+                    try:
+                        save_user_template(selected_personal_template, edited_name, edited_prompt)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.rerun()
+                if remove_template_clicked:
+                    delete_user_template(selected_personal_template)
+                    st.rerun()
+        if created_template := st.session_state.pop("rating_template_created", None):
+            st.success(f"已新增“{template_label(created_template)}”，请选择它并保存全部设置。")
     with st.form("runtime-settings"):
-        api_left, api_right = st.columns(2)
-        dashscope_key = api_left.text_input("百炼 API Key", value=env_value("DASHSCOPE_API_KEY"), type="default" if reveal_secrets else "password")
-        llm_key = api_right.text_input("DeepSeek API Key", value=env_value("LLM_API_KEY"), type="default" if reveal_secrets else "password")
-        recording_cols = st.columns(3)
+        api_section = st.expander("API 密钥", expanded=True)
+        api_left, api_right = api_section.columns(2)
+        dashscope_key = api_left.text_input("百炼 API Key", value=env_value("DASHSCOPE_API_KEY"), type="default" if reveal_secrets else "password", help="用于把录音上传到阿里云百炼并生成逐字稿。可以在百炼业务空间创建。")
+        llm_key = api_right.text_input("DeepSeek API Key", value=env_value("LLM_API_KEY"), type="default" if reveal_secrets else "password", help="用于生成对话分析、日报和时段汇总，不参与语音转写。可以在 DeepSeek 开放平台创建。")
+        recording_section = st.expander("录音与存储", expanded=True)
+        recording_cols = recording_section.columns(3)
         segment_seconds = recording_cols[0].number_input("每段录音秒数", min_value=60, value=int(env_value("SEGMENT_SECONDS") or settings.segment_seconds), step=60)
         silence_threshold = recording_cols[1].number_input("静音阈值 dBFS", value=float(env_value("SILENCE_THRESHOLD_DBFS") or settings.silence_threshold_dbfs), step=1.0)
         active_seconds = recording_cols[2].number_input("最短有效声音秒数", min_value=0.0, value=float(env_value("MIN_ACTIVE_SECONDS") or settings.min_active_seconds), step=0.5)
-        model_cols = st.columns(2)
+        recording_directory = recording_section.text_input("录音默认保存目录", value=str(RECORDINGS_DIR), help="新录音与导入的副本会保存在此处。留空时默认为项目 data/recordings。")
+        dashboard_section = st.expander("看板与汇总", expanded=False)
+        model_cols = dashboard_section.columns(2)
         summary_mode = model_cols[0].selectbox("默认汇总模型", list(SUMMARY_MODE_LABELS), index=list(SUMMARY_MODE_LABELS).index(env_value("DEFAULT_SUMMARY_MODE") or settings.default_summary_mode), format_func=lambda value: SUMMARY_MODE_LABELS[value])
-        dashboard_password = model_cols[1].text_input("看板访问密码", value=env_value("DASHBOARD_PASSWORD"), type="default" if reveal_secrets else "password")
+        dashboard_password = model_cols[1].text_input("看板访问密码", value=env_value("DASHBOARD_PASSWORD"), type="default" if reveal_secrets else "password", help="修改后，新的浏览器会话需使用新密码登录。")
         dashboard_bind_address = (env_value("DASHBOARD_BIND_ADDRESS") or settings.dashboard_bind_address).strip()
-        lan_access_enabled = st.toggle(
+        lan_access_enabled = dashboard_section.toggle(
             "允许局域网访问看板",
             value=dashboard_bind_address == "0.0.0.0",
             help="开启后，同一局域网内的设备可以通过本机 IP 和端口 8501 访问看板。保存后会自动重启看板；首次开启还需允许 Windows 防火墙访问。",
         )
-        warning_gb = st.number_input("磁盘警告阈值（GB）", min_value=1.0, value=float(env_value("DISK_WARNING_GB") or settings.disk_warning_gb), step=1.0)
-        st.divider()
-        st.subheader("日报与通知")
-        st.caption("可同时发送到 QQ 邮箱、企业微信、PushPlus 或飞书机器人。QQ 邮箱的 SMTP/IMAP 服务需使用授权码，不要填写 QQ 登录密码。保存后请重启后台服务。")
-        report_enabled = st.checkbox("启用定时日报", value=(env_value("REPORT_ENABLED") or str(settings.report_enabled)).lower() == "true")
-        report_cols = st.columns(2)
-        report_times = report_cols[0].text_input("日报发送时间（24 小时制，逗号分隔）", value=env_value("REPORT_TIMES") or ",".join(settings.report_times), placeholder="12:10,18:10")
-        report_recipient = report_cols[1].text_input("接收邮箱", value=env_value("REPORT_EMAIL_RECIPIENT") or settings.report_email_recipient)
-        report_channels = st.multiselect(
-            "发送渠道",
-            ["smtp", "wecom", "pushplus", "feishu"],
-            default=list(settings.report_channels),
-            format_func={"smtp": "QQ 邮箱", "wecom": "企业微信机器人", "pushplus": "PushPlus", "feishu": "飞书机器人"}.get,
+        local_no_password = model_cols[1].toggle(
+            "本机免密码访问",
+            value=(env_value("DASHBOARD_LOCAL_NO_PASSWORD") or str(settings.dashboard_local_no_password)).lower() == "true",
+            disabled=lan_access_enabled,
+            help="仅在看板只监听本机 127.0.0.1 时可用。启用局域网访问后会自动关闭。",
         )
-        smtp_cols = st.columns(3)
-        smtp_username = smtp_cols[0].text_input("QQ 邮箱账号", value=env_value("REPORT_SMTP_USERNAME") or settings.report_smtp_username, placeholder="name@qq.com")
-        smtp_host = smtp_cols[1].text_input("SMTP 服务器", value=env_value("REPORT_SMTP_HOST") or settings.report_smtp_host)
-        smtp_port = smtp_cols[2].number_input("SMTP 端口", min_value=1, max_value=65535, value=int(env_value("REPORT_SMTP_PORT") or settings.report_smtp_port), step=1)
-        smtp_auth_code = st.text_input("QQ 邮箱 SMTP 授权码", value=env_value("REPORT_SMTP_AUTH_CODE"), type="password", help="在 QQ 邮箱设置中开启 SMTP 后生成；不会以明文显示。")
-        st.markdown("**飞书机器人**")
-        feishu_cols = st.columns(2)
-        feishu_app_id = feishu_cols[0].text_input("飞书 App ID", value=env_value("FEISHU_APP_ID"), type="default" if reveal_secrets else "password")
-        feishu_chat_name = feishu_cols[1].text_input("飞书通知群名称", value=env_value("FEISHU_CHAT_NAME"), placeholder="录音日报")
-        feishu_app_secret = st.text_input("飞书 App Secret", value=env_value("FEISHU_APP_SECRET"), type="default" if reveal_secrets else "password")
-        st.markdown("**邮件查询方式**：从上述 QQ 邮箱给自己发送任意邮件，系统会回复当前报告；在主题或正文写 `2026-08-12` 或 `2026年8月12日`，会回复对应日期的历史报告。系统只处理该邮箱自己发给自己的邮件，自动日报不会触发回复。")
-        query_cols = st.columns(3)
-        report_query_enabled = query_cols[0].checkbox("启用收件查询", value=(env_value("REPORT_QUERY_ENABLED") or str(settings.report_query_enabled)).lower() == "true")
-        imap_host = query_cols[1].text_input("IMAP 服务器", value=env_value("REPORT_IMAP_HOST") or settings.report_imap_host)
-        imap_port = query_cols[2].number_input("IMAP 端口", min_value=1, max_value=65535, value=int(env_value("REPORT_IMAP_PORT") or settings.report_imap_port), step=1)
-        query_interval = st.number_input("收件查询间隔（秒）", min_value=20, value=int(env_value("REPORT_QUERY_INTERVAL_SECONDS") or settings.report_query_interval_seconds), step=10)
-        save_settings = st.form_submit_button("保存全部设置")
+        warning_gb = dashboard_section.number_input("磁盘警告阈值（GB）", min_value=1.0, value=float(env_value("DISK_WARNING_GB") or settings.disk_warning_gb), step=1.0)
+        st.divider()
+        with st.expander("日报与通知", expanded=False):
+            st.caption("可同时发送到 QQ 邮箱、企业微信、PushPlus 或飞书机器人。QQ 邮箱的 SMTP/IMAP 服务需使用授权码，不要填写 QQ 登录密码。保存后请重启后台服务。")
+            report_enabled = st.checkbox("启用定时日报", value=(env_value("REPORT_ENABLED") or str(settings.report_enabled)).lower() == "true")
+            report_cols = st.columns(2)
+            report_times = report_cols[0].text_input("日报发送时间（24 小时制，逗号分隔）", value=env_value("REPORT_TIMES") or ",".join(settings.report_times), placeholder="12:10,18:10")
+            report_recipient = report_cols[1].text_input("接收邮箱", value=env_value("REPORT_EMAIL_RECIPIENT") or settings.report_email_recipient)
+            report_channels = st.multiselect(
+                "发送渠道",
+                ["smtp", "wecom", "pushplus", "feishu"],
+                default=list(settings.report_channels),
+                format_func={"smtp": "QQ 邮箱", "wecom": "企业微信机器人", "pushplus": "PushPlus", "feishu": "飞书机器人"}.get,
+            )
+            smtp_cols = st.columns(3)
+            smtp_username = smtp_cols[0].text_input("QQ 邮箱账号", value=env_value("REPORT_SMTP_USERNAME") or settings.report_smtp_username, placeholder="name@qq.com")
+            smtp_host = smtp_cols[1].text_input("SMTP 服务器", value=env_value("REPORT_SMTP_HOST") or settings.report_smtp_host)
+            smtp_port = smtp_cols[2].number_input("SMTP 端口", min_value=1, max_value=65535, value=int(env_value("REPORT_SMTP_PORT") or settings.report_smtp_port), step=1)
+            smtp_auth_code = st.text_input("QQ 邮箱 SMTP 授权码", value=env_value("REPORT_SMTP_AUTH_CODE"), type="password", help="在 QQ 邮箱设置中开启 SMTP 后生成；不会以明文显示。")
+            st.markdown("**飞书机器人**")
+            feishu_cols = st.columns(2)
+            feishu_app_id = feishu_cols[0].text_input("飞书 App ID", value=env_value("FEISHU_APP_ID"), type="default" if reveal_secrets else "password")
+            feishu_chat_name = feishu_cols[1].text_input("飞书通知群名称", value=env_value("FEISHU_CHAT_NAME"), placeholder="录音日报")
+            feishu_app_secret = st.text_input("飞书 App Secret", value=env_value("FEISHU_APP_SECRET"), type="default" if reveal_secrets else "password")
+            st.markdown("**邮件查询方式**：从上述 QQ 邮箱给自己发送任意邮件，系统会回复当前报告；在主题或正文写 `2026-08-12` 或 `2026年8月12日`，会回复对应日期的历史报告。系统只处理该邮箱自己发给自己的邮件，自动日报不会触发回复。")
+            query_cols = st.columns(3)
+            report_query_enabled = query_cols[0].checkbox("启用收件查询", value=(env_value("REPORT_QUERY_ENABLED") or str(settings.report_query_enabled)).lower() == "true")
+            imap_host = query_cols[1].text_input("IMAP 服务器", value=env_value("REPORT_IMAP_HOST") or settings.report_imap_host)
+            imap_port = query_cols[2].number_input("IMAP 端口", min_value=1, max_value=65535, value=int(env_value("REPORT_IMAP_PORT") or settings.report_imap_port), step=1)
+            query_interval = st.number_input("收件查询间隔（秒）", min_value=20, value=int(env_value("REPORT_QUERY_INTERVAL_SECONDS") or settings.report_query_interval_seconds), step=10)
+        st.caption("修改上方任何选项后，点击保存才会生效。")
+        save_settings = st.form_submit_button("保存全部设置", type="primary", use_container_width=True)
     if save_settings:
         new_dashboard_bind_address = "0.0.0.0" if lan_access_enabled else "127.0.0.1"
+        if not dashboard_password.strip():
+            st.error("看板密码不能为空。如需本机免密码访问，请保留密码并开启“本机免密码访问”。")
+            st.stop()
+        configured_directory = recording_directory.strip()
+        recording_path = (ROOT / configured_directory).resolve() if configured_directory and not Path(configured_directory).is_absolute() else Path(configured_directory).expanduser().resolve() if configured_directory else ROOT / "data" / "recordings"
+        try:
+            recording_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            st.error(f"无法使用录音目录：{exc}")
+            st.stop()
+        recording_directory_changed = recording_path != RECORDINGS_DIR.resolve()
         values = {
             "DASHSCOPE_API_KEY": dashscope_key.strip(), "LLM_API_KEY": llm_key.strip(),
             "SEGMENT_SECONDS": str(int(segment_seconds)), "SILENCE_THRESHOLD_DBFS": str(silence_threshold),
             "MIN_ACTIVE_SECONDS": str(active_seconds), "DEFAULT_SUMMARY_MODE": summary_mode,
+            "RATING_TEMPLATE": rating_template, "RATING_CUSTOM_PROMPT": "",
+            "RECORDINGS_DIR": str(recording_path),
             "DASHBOARD_PASSWORD": dashboard_password, "DISK_WARNING_GB": str(warning_gb),
             "DASHBOARD_BIND_ADDRESS": new_dashboard_bind_address,
+            "DASHBOARD_LOCAL_NO_PASSWORD": str(local_no_password and not lan_access_enabled).lower(),
             "REPORT_ENABLED": str(report_enabled).lower(), "REPORT_TIMES": report_times.strip(),
             "REPORT_CHANNELS": ",".join(report_channels), "REPORT_EMAIL_RECIPIENT": report_recipient.strip(),
             "REPORT_SMTP_USERNAME": smtp_username.strip(), "REPORT_SMTP_HOST": smtp_host.strip(),
@@ -1068,11 +1342,12 @@ with settings_tab:
         for key, value in values.items():
             save_env_value(key, value)
             os.environ[key] = value
-        if dashboard_bind_address != new_dashboard_bind_address:
+        request_recorder_restart()
+        if dashboard_bind_address != new_dashboard_bind_address or recording_directory_changed:
             request_dashboard_restart()
-            st.success("已写入 .env。看板正在自动重启以应用局域网访问设置，请在几秒后刷新页面。")
+            st.success("已写入 .env。看板正在自动重启以应用新的保存目录或局域网访问设置，请在几秒后刷新页面。")
         else:
-            st.success("已写入 .env。请重启后台服务以应用录音、转写和分析参数。")
+            st.success("已写入 .env。录音器正在平滑重启以应用录音目录和分段参数；其他后台参数在下次重启全部服务后生效。")
     with st.expander("高级：编辑完整 .env 配置文档", expanded=False):
         document = st.text_area(".env", value=read_env_document(), height=360, key="env-document")
         if st.button("保存完整配置文档"):
@@ -1082,3 +1357,6 @@ with settings_tab:
                 st.error(str(exc))
             else:
                 st.success(".env 已保存。请重启后台服务以加载新的配置。")
+
+with help_tab:
+    render_help_page()

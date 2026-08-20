@@ -347,6 +347,7 @@ def find_dashboard_overview(
     statuses: list[str] | None = None,
     recorded_on: date | None = None,
     ratings: list[int] | None = None,
+    tags: list[str] | None = None,
     favorites_only: bool = False,
     newest_first: bool = True,
     limit: int = 100,
@@ -372,6 +373,10 @@ def find_dashboard_overview(
         rating_cases = ",".join("?" for _ in ratings)
         clauses.append(f"CASE WHEN json_valid(conversation_analysis) THEN excitement_rating ELSE 0 END IN ({rating_cases})")
         values.extend(ratings)
+    if tags:
+        tag_cases = ",".join("?" for _ in tags)
+        clauses.append(f"EXISTS (SELECT 1 FROM json_each(segments.tags) WHERE value IN ({tag_cases}))")
+        values.extend(tags)
     if favorites_only:
         clauses.append("favorite = 1")
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -389,6 +394,15 @@ def find_dashboard_overview(
             [*values, limit, offset],
         ).fetchall()
     return rows, total
+
+
+def list_segment_tags() -> list[str]:
+    """Return user-created archive tags for the tag filter."""
+    with transaction() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT value FROM segments, json_each(segments.tags) WHERE TRIM(value) <> '' ORDER BY value COLLATE NOCASE"
+        ).fetchall()
+    return [str(row["value"]) for row in rows]
 
 
 def dashboard_segment(segment_id: int) -> sqlite3.Row | None:

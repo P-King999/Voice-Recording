@@ -100,7 +100,29 @@ def save_env_document(content: str) -> None:
     _persist_env_document(env_path, content.rstrip() + "\n")
 
 
+def dashboard_access_mode(password: str, bind_address: str, local_no_password: bool) -> str:
+    """Return the dashboard access flow for the current local configuration."""
+    if not password.strip():
+        return "setup"
+    if bind_address.strip() == "127.0.0.1" and local_no_password:
+        return "unprotected"
+    return "login"
+
+
 load_dotenv()
+
+
+def configured_recordings_dir() -> Path:
+    """Resolve the user-selected recording directory from the local configuration."""
+    configured = os.getenv("RECORDINGS_DIR", "").strip()
+    if not configured:
+        return DATA_DIR / "recordings"
+    path = Path(configured).expanduser()
+    return (ROOT / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+# Reassign after .env is loaded so every importing service uses the selected folder.
+RECORDINGS_DIR = configured_recordings_dir()
 load_secret_file("LLM_API_KEY", "deepseekkey.txt")
 load_secret_file("DASHSCOPE_API_KEY", "dashscopekey.txt")
 load_secret_file("DASHSCOPE_API_KEY", "bailiankey.txt")
@@ -145,12 +167,15 @@ class Settings:
     dashscope_delete_uploaded_file: bool = os.getenv("DASHSCOPE_DELETE_UPLOADED_FILE", "true").lower() == "true"
     dashscope_enable_diarization: bool = os.getenv("DASHSCOPE_ENABLE_DIARIZATION", "true").lower() == "true"
     default_summary_mode: str = os.getenv("DEFAULT_SUMMARY_MODE", "deepseek_v4_flash").lower()
+    rating_template: str = os.getenv("RATING_TEMPLATE", "general").lower()
+    rating_custom_prompt: str = os.getenv("RATING_CUSTOM_PROMPT", "")
     bailian_summary_model: str = os.getenv("BAILIAN_SUMMARY_MODEL", "qwen-plus")
     llm_url: str = os.getenv("LLM_API_URL", "https://api.deepseek.com/chat/completions").rstrip("/")
     llm_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "deepseek-chat")
     dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "")
     dashboard_bind_address: str = os.getenv("DASHBOARD_BIND_ADDRESS", "127.0.0.1").strip() or "127.0.0.1"
+    dashboard_local_no_password: bool = os.getenv("DASHBOARD_LOCAL_NO_PASSWORD", "false").lower() == "true"
     disk_warning_gb: float = float(os.getenv("DISK_WARNING_GB", "10"))
     report_enabled: bool = os.getenv("REPORT_ENABLED", "false").lower() == "true"
     report_times: tuple[str, ...] = tuple(

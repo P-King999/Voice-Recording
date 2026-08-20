@@ -248,11 +248,22 @@ class VoiceRecorderAgent:
         self.pid_path("dashboard").unlink(missing_ok=True)
         dashboard.next_start_at = 0.0
 
+    def recorder_is_paused(self) -> bool:
+        return (self.runtime_dir / "recorder.paused").exists()
+
     def supervise_once(self) -> None:
         self.handle_dashboard_restart_request()
         now = time.monotonic()
         for service in self.services.values():
             process = service.process
+            if service.spec.name == "recorder" and self.recorder_is_paused():
+                if process is not None and process.poll() is None:
+                    logging.info("Pausing recorder on dashboard request")
+                    self.stop_service(service, timeout=RECORDER_STOP_TIMEOUT_SECONDS)
+                service.process = None
+                service.started_at = 0.0
+                self.pid_path("recorder").unlink(missing_ok=True)
+                continue
             if service.disabled:
                 continue
             if process is None:

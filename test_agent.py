@@ -75,6 +75,19 @@ class AgentTests(unittest.TestCase):
         stop_service.assert_called_once_with(recorder, timeout=agent.RECORDER_STOP_TIMEOUT_SECONDS)
         self.assertIsNone(recorder.process)
 
+    def test_paused_recorder_is_stopped_without_being_scheduled_for_restart(self) -> None:
+        recorder = self.instance.services["recorder"]
+        self.instance.services = {"recorder": recorder}
+        recorder.process = FakeProcess()  # type: ignore[assignment]
+        (self.instance.runtime_dir / "recorder.paused").touch()
+
+        with patch.object(self.instance, "stop_service") as stop_service:
+            self.instance.supervise_once()
+
+        stop_service.assert_called_once_with(recorder, timeout=agent.RECORDER_STOP_TIMEOUT_SECONDS)
+        self.assertIsNone(recorder.process)
+        self.assertEqual(recorder.next_start_at, 0.0)
+
     def test_dashboard_restart_request_stops_only_the_dashboard(self) -> None:
         dashboard = self.instance.services["dashboard"]
         dashboard.process = FakeProcess()  # type: ignore[assignment]

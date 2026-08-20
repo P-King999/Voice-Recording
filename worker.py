@@ -19,6 +19,7 @@ from dashscope import Generation
 from bailian_filetrans import is_configured as bailian_is_configured
 from bailian_filetrans import transcribe as bailian_transcribe
 from config import FAILED_DIR, RECORDINGS_DIR, SILENT_DIR, ensure_storage, settings
+from rating_templates import rating_instruction
 from storage import (
     add_segment,
     init_db,
@@ -244,7 +245,7 @@ def _excitement_rating(raw_analysis: str | None) -> int:
         return 1
     try:
         value = json.loads(raw_analysis).get("excitement_rating", 1)
-        return min(5, max(1, int(value)))
+        return min(5, max(0, int(value)))
     except (TypeError, ValueError, json.JSONDecodeError):
         return 1
 
@@ -262,7 +263,16 @@ def analyze_transcript_conversation(transcript: str | None, raw_timeline: str | 
             "model": settings.llm_model,
             "messages": [
                 {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
-                {"role": "user", "content": CONVERSATION_USER_PROMPT + source},
+                {
+                    "role": "user",
+                    "content": (
+                        CONVERSATION_USER_PROMPT
+                        + "\n\n以下评分规则覆盖上方 JSON 示例中的所有星级说明：\n"
+                        + rating_instruction(settings.rating_template, settings.rating_custom_prompt)
+                        + "\n请将整体和每个事件的 excitement_rating 都按此规则输出 0 到 5 的整数。\n\n"
+                        + source
+                    ),
+                },
             ],
             "temperature": 0.2,
         },
@@ -304,8 +314,16 @@ def process(segment_id: int, path: Path) -> None:
     if not path.exists():
         update_segment(segment_id, status="failed", error="本地音频文件不存在。", lease_owner=None, lease_expires_at=None)
         return
-    dbfs, active_seconds = audio_activity(path)
-    update_segment(segment_id, dbfs=dbfs, active_seconds=active_seconds)
+    try:
+        dbfs, active_seconds = audio_activity(path)
+    except (OSError, RuntimeError):
+        # Some valid imported formats (for example M4A or WMA) are decoded by
+        # FFmpeg but not by the local SoundFile build used for silence detection.
+        path = convert_to_mp3(segment_id, path)
+        dbfs, active_seconds = audio_activity(path)
+    with sf.SoundFile(path) as audio:
+        duration_seconds = len(audio) / audio.samplerate
+    update_segment(segment_id, dbfs=dbfs, active_seconds=active_seconds, duration_seconds=duration_seconds)
     if active_seconds < settings.min_active_seconds:
         silent_path = SILENT_DIR / path.name
         shutil.move(str(path), silent_path)

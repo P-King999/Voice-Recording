@@ -15,6 +15,7 @@ AppName=Voice Recording
 AppVersion={#AppVersion}
 AppPublisher=Voice Recording
 DefaultDirName={localappdata}\Programs\VoiceRecording
+DisableDirPage=no
 DefaultGroupName=Voice Recording
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
