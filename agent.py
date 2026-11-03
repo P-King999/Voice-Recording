@@ -271,11 +271,29 @@ class VoiceRecorderAgent:
         self.pid_path("dashboard").unlink(missing_ok=True)
         dashboard.next_start_at = 0.0
 
+    def handle_service_restart_requests(self) -> None:
+        """Restart one worker after API keys or model settings changed."""
+        for name in ("worker", "summary_scheduler", "reporter"):
+            request_path = self.runtime_dir / f"{name}.restart"
+            if not request_path.exists():
+                continue
+            request_path.unlink(missing_ok=True)
+            service = self.services.get(name)
+            if service is None or service.disabled:
+                continue
+            logging.info("Restarting %s to apply new settings", name)
+            self.stop_service(service)
+            service.process = None
+            service.started_at = 0.0
+            self.pid_path(name).unlink(missing_ok=True)
+            service.next_start_at = 0.0
+
     def recorder_is_paused(self) -> bool:
         return (self.runtime_dir / "recorder.paused").exists()
 
     def supervise_once(self) -> None:
         self.handle_dashboard_restart_request()
+        self.handle_service_restart_requests()
         now = time.monotonic()
         for service in self.services.values():
             process = service.process
