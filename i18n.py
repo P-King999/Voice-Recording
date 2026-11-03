@@ -10,6 +10,7 @@ translated screen never breaks.
 import os
 
 from config import save_env_value
+from i18n_ui import UI_STRINGS
 
 LANGUAGES: dict[str, str] = {"zh": "简体中文", "en": "English"}
 
@@ -73,7 +74,7 @@ def set_language(code: str) -> None:
 
 
 def t(key: str, **kwargs: object) -> str:
-    entry = STRINGS.get(key)
+    entry = STRINGS.get(key) or UI_STRINGS.get(key)
     if not entry:
         return key
     text = entry.get(current_language()) or entry.get("zh") or key
