@@ -96,8 +96,13 @@ def check(force: bool = False) -> dict[str, object]:
 
     release = latest_release()
     if release is None:
-        cached.setdefault("current", current_version())
+        # Record the attempt so an offline machine retries in six hours, not every minute.
+        cached.update({"checked_at": time.time(), "current": current_version()})
         cached.setdefault("available", False)
+        try:
+            _write_cache(cached)
+        except OSError:
+            pass
         return cached
 
     tag = str(release.get("tag_name") or "").lstrip("vV")

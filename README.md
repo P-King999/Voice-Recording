@@ -55,8 +55,9 @@
 
 1. 打开 [Releases](https://github.com/P-King999/Voice-Recording/releases) 页面
 2. 下载最新的 `VoiceRecording-Setup-x.y.z.exe`
-3. 双击安装 → 双击桌面上的 **Voice Recorder** → 浏览器打开 `http://localhost:8501`
-4. 首次进入会引导你填两个 API Key（见下一节）
+3. 双击安装（向导里可勾选「创建桌面快捷方式」）→ 从桌面或开始菜单打开 **Voice Recording**
+   浏览器会自动打开 `http://localhost:8501`
+4. 首次进入先设置一个看板密码（只用于本机网页登录），然后按引导填两个 API Key（见下一节）
 
 > 安装包为当前用户安装，不需要管理员权限；升级时会保留录音、数据库和配置。
 
@@ -180,6 +181,10 @@ runtime/         日志和进程状态，出问题先看这里
 **👉 [进阶使用与配置](docs/advanced.md)**
 
 ---
+
+## 📄 许可
+
+本项目使用 **MIT License**，可自由使用、修改和分发（保留版权声明）。
 
 ## ⚖️ 隐私与合规
 

@@ -903,6 +903,11 @@ def render_first_open_guide() -> None:
     st.caption(
         t("u013")
     )
+    st.caption(
+        "② 下一步：到「设置 → 录音设备」点“测试麦克风”，确认能听到声音后保存并切换。"
+        " ③ 然后回到首页即可开始录音。 / Next: pick a microphone in Settings, then start recording."
+    )
+
 
 
 def render_help_page() -> None:
