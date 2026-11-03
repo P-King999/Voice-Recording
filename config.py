@@ -179,6 +179,8 @@ class Settings:
     disk_warning_gb: float = float(os.getenv("DISK_WARNING_GB", "10"))
     recover_partial_days: int = env_int("RECOVER_PARTIAL_DAYS", 7)
     empty_retention_days: int = env_int("EMPTY_RETENTION_DAYS", 30)
+    update_repo: str = os.getenv("UPDATE_REPO", "P-King999/Voice-Recording").strip()
+    update_github_token: str = os.getenv("UPDATE_GITHUB_TOKEN", "").strip()
     report_enabled: bool = os.getenv("REPORT_ENABLED", "false").lower() == "true"
     report_times: tuple[str, ...] = tuple(
         value.strip() for value in os.getenv("REPORT_TIMES", "12:10,17:10,21:10").split(",") if value.strip()

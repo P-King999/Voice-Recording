@@ -124,6 +124,12 @@ def main() -> None:
         except Exception:
             logging.exception("Scheduled summary check failed")
         try:
+            import updater
+
+            updater.check()
+        except Exception:
+            logging.exception("Update check failed")
+        try:
             import maintenance
 
             maintenance.run_scheduled_cleanup()

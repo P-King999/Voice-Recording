@@ -32,6 +32,7 @@ import maintenance
 import models as model_catalog
 import i18n
 import report_book as book
+import updater
 from i18n import t
 from rating_templates import (
     delete_user_template,
@@ -540,21 +541,11 @@ def require_authentication() -> None:
     st.stop()
 
 
-def render_language_selector() -> None:
-    """右上角只有一个小地球图标；完整的语言设置放在「设置」页。"""
-    spacer, icon = st.columns([12, 1], vertical_alignment="center")
-    with icon:
-        with st.popover("🌐", help=t("language.label")):
-            for code, name in i18n.LANGUAGES.items():
-                active = code == i18n.current_language()
-                if st.button(
-                    ("✓ " if active else "") + name,
-                    key=f"language-{code}",
-                    disabled=active,
-                    use_container_width=True,
-                ):
-                    i18n.set_language(code)
-                    st.rerun()
+def status_text(status: object) -> str:
+    """Status words are data labels, so they get their own translation keys."""
+    name = str(status)
+    key = f"status.{name}"
+    return t(key) if key in i18n.UI_STRINGS else STATUS_LABELS.get(name, name)
 
 
 st.set_page_config(page_title="录音档案", page_icon="R", layout="wide")
@@ -787,7 +778,7 @@ def render_record_detail(record: dict[str, object], widget_prefix: str) -> None:
         update_segment(int(record["id"]), tags=json.dumps([item.strip() for item in tags.split(",") if item.strip()], ensure_ascii=False), notes=notes)
         clear_record_caches()
         st.rerun()
-    analysis_tab, transcript_tab = st.tabs(["对话分析", "逐字稿与音频"])
+    analysis_tab, transcript_tab = st.tabs([t("tab.analysis"), t("tab.transcript")])
     with analysis_tab:
         render_conversation_analysis(record, widget_prefix)
     with transcript_tab:
@@ -872,6 +863,13 @@ def render_first_open_guide() -> None:
         return
     st.info(t("u012"))
     with st.form("onboarding-keys", clear_on_submit=False):
+        chosen_language = st.selectbox(
+            t("language.label"),
+            list(i18n.LANGUAGES),
+            index=list(i18n.LANGUAGES).index(i18n.current_language()),
+            format_func=lambda code: i18n.LANGUAGES[code],
+            help="界面语言可以随时在「设置」里修改。",
+        )
         st.markdown(t("u044"))
         key_left, key_right = st.columns(2)
         dashscope_key = key_left.text_input(
@@ -882,11 +880,13 @@ def render_first_open_guide() -> None:
         )
         submitted = st.form_submit_button(t("u047"), type="primary")
     if submitted:
+        if chosen_language != i18n.current_language():
+            i18n.set_language(chosen_language)
         saved = []
         if dashscope_key.strip():
             save_env_value("DASHSCOPE_API_KEY", dashscope_key.strip())
             os.environ["DASHSCOPE_API_KEY"] = dashscope_key.strip()
-            saved.append("百炼")
+            saved.append(t("u096"))
         if deepseek_key.strip():
             save_env_value("LLM_API_KEY", deepseek_key.strip())
             os.environ["LLM_API_KEY"] = deepseek_key.strip()
@@ -941,7 +941,26 @@ transcripts stay on your own laptop.*
         )
 
 
-render_language_selector()
+def render_update_banner() -> None:
+    """Show a cached update notice; the background scheduler refreshes the cache."""
+    cached = updater.read_cached()
+    if not cached.get("available"):
+        return
+    left, right = st.columns([5, 1], vertical_alignment="center")
+    left.info(
+        f"🎉 {t('update.available')} v{cached.get('latest')}"
+        f"（{t('update.current')} v{cached.get('current')}）"
+    )
+    if right.button(t("update.now"), type="primary", key="update-now"):
+        with st.spinner("Downloading the installer..."):
+            installer = updater.download(int(cached.get("asset_id") or 0), str(cached.get("asset_name") or ""))
+        updater.launch_installer(installer)
+        st.success(
+            "升级程序已启动：服务会停止、安装、然后自动重启，大约 1 分钟。稍后刷新本页即可。"
+        )
+
+
+render_update_banner()
 st.title(t("app.title"))
 render_first_open_guide()
 home_tab, archive_tab, settings_tab, help_tab = st.tabs(
@@ -1090,7 +1109,7 @@ with home_tab:
                 visible_items = [item for item in items if not is_empty_record(item)][:8]
                 empty_items = [item for item in items if is_empty_record(item)]
                 for item in visible_items:
-                    status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+                    status = status_text(item["status"])
                     title, favorite_action, button = st.columns([4, 1, 1])
                     title.write(overview_title(item))
                     title.caption(f"{rating_label(item)}{source_badge(item)} · {record_recorded_at(item):%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
@@ -1118,7 +1137,7 @@ with home_tab:
                                 {
                                     "时间": f"{record_recorded_at(item):%m-%d %H:%M}",
                                     "时长": f"{item['duration_seconds'] / 60:.1f} 分钟",
-                                    "状态": STATUS_LABELS.get(str(item["status"]), str(item["status"])),
+                                    "状态": status_text(item["status"]),
                                 }
                                 for item in empty_items[:50]
                             ],
@@ -1312,7 +1331,7 @@ with archive_tab:
                     archive_list_scroll.divider()
                 archive_list_scroll.markdown(f"#### {recording_at:%Y年%m月%d日}")
                 visible_recording_date = recording_at.date()
-            status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+            status = status_text(item["status"])
             title, timestamp, favorite_action, action = archive_list_scroll.columns([5, 3, 1, 1])
             title.write(overview_title(item))
             timestamp.caption(f"{rating_label(item)}{source_badge(item)} · {record_recorded_at(item):%Y-%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
@@ -1325,7 +1344,7 @@ with archive_tab:
         if empty_results and show_empty:
             with archive_list_scroll.expander(f"无内容录音（{len(empty_results)} 条）", expanded=False):
                 for item in empty_results:
-                    status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
+                    status = status_text(item["status"])
                     title, timestamp, favorite_action, action = st.columns([5, 3, 1, 1])
                     title.write(overview_title(item))
                     timestamp.caption(f"{rating_label(item)}{source_badge(item)} · {record_recorded_at(item):%Y年%m月%d日 %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
@@ -1395,6 +1414,16 @@ with settings_tab:
     language_row[1].caption("界面语言保存在 .env 的 UI_LANGUAGE，切换后立即生效。")
     if chosen_language != i18n.current_language():
         i18n.set_language(chosen_language)
+        st.rerun()
+    version_row = st.columns([3, 2], vertical_alignment="center")
+    version_row[0].caption(f"{t('update.current')}: v{updater.current_version()}")
+    if version_row[1].button(t("update.check"), key="check-update"):
+        with st.spinner("Checking GitHub releases..."):
+            fresh = updater.check(force=True)
+        if fresh.get("available"):
+            st.success(f"{t('update.available')} v{fresh.get('latest')} — {t('update.now')}")
+        else:
+            st.info(t("update.latest"))
         st.rerun()
     device_section = st.expander(t("u022"), expanded=True)
     device_options, device_labels = input_device_options()
