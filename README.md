@@ -44,6 +44,8 @@
 <p align="center"><img src="docs/images/dashboard-home.png" width="900" alt="看板首页" /></p>
 
 > 首页：实时录音状态 · 磁盘/服务健康 · 今日统计 · 时段汇总（含摘要和时段分布）
+>
+> 🌐 界面支持 **简体中文 / English** 切换（右上角），默认简体中文。
 
 ---
 

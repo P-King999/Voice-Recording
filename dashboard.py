@@ -30,7 +30,9 @@ from exports import markdown as export_markdown, srt as export_srt, word_html
 from health import snapshot
 import maintenance
 import models as model_catalog
+import i18n
 import report_book as book
+from i18n import t
 from rating_templates import (
     delete_user_template,
     rating_instruction,
@@ -538,6 +540,22 @@ def require_authentication() -> None:
     st.stop()
 
 
+def render_language_selector() -> None:
+    """简体中文默认，可切换到 English（写入 .env，下次打开仍然生效）。"""
+    selector = st.columns([1, 5])
+    current = i18n.current_language()
+    chosen = selector[0].selectbox(
+        t("language.label"),
+        list(i18n.LANGUAGES),
+        index=list(i18n.LANGUAGES).index(current),
+        format_func=lambda code: i18n.LANGUAGES[code],
+        key="ui-language",
+    )
+    if chosen != current:
+        i18n.set_language(chosen)
+        st.rerun()
+
+
 st.set_page_config(page_title="录音档案", page_icon="R", layout="wide")
 require_authentication()
 ensure_storage()
@@ -893,7 +911,7 @@ def render_first_open_guide() -> None:
 
 
 def render_help_page() -> None:
-    st.subheader("使用说明")
+    st.subheader(t("help.title"))
     with st.expander("开始录音与暂停", expanded=True):
         st.write("首页会显示录音器和处理器状态。点击暂停录音会先封存当前片段，已保存内容仍会继续转写；点击继续录音会重新打开麦克风。实时监听只用于确认麦克风输入，不会影响保存的音频。")
     with st.expander("导入已有录音"):
@@ -928,27 +946,30 @@ transcripts stay on your own laptop.*
         )
 
 
-st.title("录音档案")
+render_language_selector()
+st.title(t("app.title"))
 render_first_open_guide()
-home_tab, archive_tab, settings_tab, help_tab = st.tabs(["首页", "搜索与档案", "设置", "使用说明"])
+home_tab, archive_tab, settings_tab, help_tab = st.tabs(
+    [t("tab.home"), t("tab.archive"), t("tab.settings"), t("tab.help")]
+)
 
 with home_tab:
     health = snapshot(ROOT)
     health_cols = st.columns(4)
-    health_cols[0].metric("磁盘可用", f"{health['free_gb']:.1f} GB")
-    health_cols[1].metric("数据库", "正常" if health["database_ok"] else "异常")
-    health_cols[2].metric("录音器", "运行中" if health["services"].get("recorder") else "未运行")
-    health_cols[3].metric("处理器", "运行中" if health["services"].get("worker") else "未运行")
+    health_cols[0].metric(t("home.disk"), f"{health['free_gb']:.1f} GB")
+    health_cols[1].metric(t("home.database"), "正常" if health["database_ok"] else "异常")
+    health_cols[2].metric(t("home.recorder"), "运行中" if health["services"].get("recorder") else "未运行")
+    health_cols[3].metric(t("home.worker"), "运行中" if health["services"].get("worker") else "未运行")
     if health["free_gb"] < settings.disk_warning_gb:
         st.error(f"磁盘空间不足：仅剩 {health['free_gb']:.1f} GB，请及时归档或清理录音。")
     recording_action, recording_hint = st.columns([1, 5], vertical_alignment="center")
     if recorder_is_paused():
-        if recording_action.button("继续录音", type="primary", key="resume-recording"):
+        if recording_action.button(t("home.resume"), type="primary", key="resume-recording"):
             set_recorder_paused(False)
             st.rerun()
         recording_hint.caption("录音已暂停：当前片段已封存，等待处理的录音会继续分析。")
     else:
-        if recording_action.button("暂停录音", key="pause-recording"):
+        if recording_action.button(t("home.pause"), key="pause-recording"):
             set_recorder_paused(True)
             st.rerun()
         recording_hint.caption("暂停会安全封存当前片段，不会中断已入队的转写与分析。")
@@ -958,26 +979,26 @@ with home_tab:
         render_live_recording()
     counts = dashboard_counts()
     metrics = st.columns(4)
-    metrics[0].metric("有效录音", counts.get("content", 0), help="有逐字稿或分析标题的录音；静音和转写失败不计入")
-    metrics[1].metric("已完成", counts.get("content_complete", 0))
-    metrics[2].metric("等待处理", counts.get("pending", 0))
-    metrics[3].metric("无内容", counts.get("empty", 0), help="静音或转写失败的片段，不计入统计，达到保留期限后自动清理")
+    metrics[0].metric(t("home.valid"), counts.get("content", 0), help="有逐字稿或分析标题的录音；静音和转写失败不计入")
+    metrics[1].metric(t("home.done"), counts.get("content_complete", 0))
+    metrics[2].metric(t("home.pending"), counts.get("pending", 0))
+    metrics[3].metric(t("home.empty"), counts.get("empty", 0), help="静音或转写失败的片段，不计入统计，达到保留期限后自动清理")
     if counts.get("empty"):
         st.caption(
             f"另有 {counts['empty']} 条无内容录音（静音 / 转写失败）已从统计和列表隐藏，"
             f"{settings.empty_retention_days} 天后自动删除。"
         )
-    st.subheader("时段汇总")
+    st.subheader(t("home.summary"))
     now = datetime.now().astimezone()
     choice = st.segmented_control("汇总范围", ["本日", "本日上午", "本日下午", "本日晚上", "本周", "本月"], default="本日", key="home-summary-period")
     period_type, period_start, period_end, period_label = period_details(choice or "本日", now)
     period_stats = book.range_stats(period_start, min(period_end, now))
 
     cards = st.columns(4)
-    cards[0].metric("录音分段", f"{period_stats.segments} 个")
-    cards[1].metric("录音时长", book.hours_text(period_stats.recorded))
-    cards[2].metric("检测到说话", book.hours_text(period_stats.active))
-    cards[3].metric("可分析逐字稿", f"{period_stats.transcribed} 段")
+    cards[0].metric(t("home.period.segments"), f"{period_stats.segments} 个")
+    cards[1].metric(t("home.period.duration"), book.hours_text(period_stats.recorded))
+    cards[2].metric(t("home.period.speech"), book.hours_text(period_stats.active))
+    cards[3].metric(t("home.period.transcripts"), f"{period_stats.transcribed} 段")
     if period_end <= period_start:
         st.caption(f"{period_label} 还没有开始。")
     else:
@@ -1052,9 +1073,9 @@ with home_tab:
                     )
                 else:
                     st.caption("这个时段还没有录音。")
-    st.subheader("本日和最近录音")
+    st.subheader(t("home.recent"))
     show_home_empty = st.toggle(
-        "显示无内容录音",
+        t("home.show_empty"),
         key="home_show_empty",
         value=False,
         help="静音和转写失败的片段默认不显示，也不计入统计。",
@@ -1125,7 +1146,7 @@ with home_tab:
         st.info("还没有录音片段。")
 
 with archive_tab:
-    with st.expander("导入已有录音进行分析", expanded=False):
+    with st.expander(t("archive.import"), expanded=False):
         st.caption("支持单个文件或本机文件夹路径，将复制副本进入管理目录并自动开始转写。原文件保持不变。")
         source_path_text = st.text_input("本机音频文件或文件夹路径", placeholder=r"D:\\Meetings\\2026-08-20")
         if st.button("导入此路径并开始分析", key="import-audio-path"):
@@ -1161,8 +1182,8 @@ with archive_tab:
             for error in errors[:5]:
                 st.warning(error)
     archive_title, favorites_action = st.columns([6, 1])
-    archive_title.subheader("全部录音")
-    if favorites_action.button("收藏夹", key="archive-favorites-toggle", type="secondary"):
+    archive_title.subheader(t("archive.title"))
+    if favorites_action.button(t("archive.favorites"), key="archive-favorites-toggle", type="secondary"):
         st.session_state["archive_favorites_only"] = not bool(st.session_state.get("archive_favorites_only", False))
         st.session_state["archive_page"] = 0
         st.session_state.pop("archive_record_id", None)
@@ -1268,7 +1289,7 @@ with archive_tab:
             archive_list_scroll.caption(
                 f"已隐藏无内容录音（静音 / 转写失败），它们不计入统计，{settings.empty_retention_days} 天后自动删除。"
             )
-        with archive_list_scroll.expander("清理无内容录音", expanded=False):
+        with archive_list_scroll.expander(t("archive.cleanup"), expanded=False):
             keep_days = st.number_input(
                 "保留最近多少天",
                 min_value=1,
@@ -1339,7 +1360,7 @@ with archive_tab:
     else:
         archive_list_scroll.info("没有符合条件的录音。")
 
-    with archive_list_scroll.expander("批量操作", expanded=False):
+    with archive_list_scroll.expander(t("archive.batch"), expanded=False):
         selected_ids = st.multiselect(
             "选择当前结果中的录音",
             [int(item["id"]) for item in results],
