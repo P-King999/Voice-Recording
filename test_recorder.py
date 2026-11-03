@@ -50,6 +50,22 @@ class RecorderDeviceSelectionTests(TestCase):
         ):
             self.assertEqual(recorder.select_loudest_input_device(), 1)
 
+    def test_truncated_device_name_from_mme_still_matches(self) -> None:
+        # MME cuts names at 31 characters, so .env can never match them exactly.
+        devices = [
+            {"name": "麦克风 (tranScreen Audio)", "max_input_channels": 2},
+            {"name": "本机麦克风阵列 (Realtek High Definitio", "max_input_channels": 2},
+        ]
+
+        with patch.object(recorder.sd, "query_devices", return_value=devices):
+            resolved = recorder.resolve_input_name("本机麦克风阵列 (Realtek High Definition Audio)")
+
+        self.assertEqual(resolved, 1)
+
+    def test_unknown_device_name_is_reported_as_missing(self) -> None:
+        with patch.object(recorder.sd, "query_devices", return_value=[]):
+            self.assertIsNone(recorder.resolve_input_name("不存在的设备"))
+
 
 class RecorderRecoveryTests(TestCase):
     def _write_interrupted_wav(self, directory: Path, name: str = "2026-11-01_19-10-55") -> Path:

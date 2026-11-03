@@ -253,6 +253,35 @@ def select_loudest_input_device() -> int:
     return index
 
 
+def resolve_input_name(name: str) -> int | None:
+    """Match a configured device name, tolerating the truncation some APIs apply.
+
+    MME reports at most 31 characters ("...Realtek High Definitio"), so an exact
+    name from .env would otherwise never match and every start would fall back.
+    """
+    wanted = name.strip()
+    if not wanted:
+        return None
+    lowered = wanted.lower()
+    devices = sd.query_devices()
+    candidates = [
+        (index, str(device["name"]))
+        for index, device in enumerate(devices)
+        if int(device["max_input_channels"]) >= settings.channels
+    ]
+    for index, device_name in candidates:
+        if device_name == wanted:
+            return index
+    for index, device_name in candidates:
+        short = device_name.lower()
+        if short.startswith(lowered) or lowered.startswith(short):
+            return index
+    for index, device_name in candidates:
+        if lowered in device_name.lower() or device_name.lower() in lowered:
+            return index
+    return None
+
+
 def recording_device(force_auto: bool = False) -> str | int | None:
     """Use a manually selected device, or detect the loudest available microphone."""
     if not force_auto and settings.device and settings.device.lower() != AUTO_DEVICE:
@@ -271,7 +300,11 @@ def recording_device(force_auto: bool = False) -> str | int | None:
             if realtek:
                 logging.warning("Configured device index %s is stale; using %s", settings.device, realtek)
                 return realtek
-        return settings.device
+            return index if 0 <= index < len(devices) else None
+        resolved = resolve_input_name(settings.device)
+        if resolved is not None:
+            return resolved
+        logging.warning("Configured input %r was not found; falling back to automatic selection", settings.device)
     return select_loudest_input_device()
 
 
