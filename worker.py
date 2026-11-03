@@ -55,11 +55,6 @@ SUMMARY_USER_PROMPT = """以下是 {period_label} 的办公室录音逐字稿。
 
 逐字稿如下：
 """
-SUMMARY_MODES = {
-    "deepseek_v4_flash": ("DeepSeek-V4-Flash", "deepseek", "deepseek-v4-flash"),
-    "deepseek_v4_pro": ("DeepSeek-V4-Pro", "deepseek", "deepseek-v4-pro"),
-    "qwen_plus": ("千问 Qwen Plus", "bailian", "qwen-plus"),
-}
 CONVERSATION_SYSTEM_PROMPT = """你是录音对话整理助手。只依据给定逐字稿整理对话主题、说话人、人物关系和事件。
 
 严格规则：
@@ -256,11 +251,13 @@ def analyze_transcript_conversation(transcript: str | None, raw_timeline: str | 
         raise ValueError("该录音还没有可用的逐字稿，无法生成对话分析。")
     if not settings.llm_key:
         raise RuntimeError("未配置 DeepSeek API Key。")
+    from models import active_chat_model
+
     response = requests.post(
         settings.llm_url,
         headers={"Authorization": f"Bearer {settings.llm_key}", "Content-Type": "application/json"},
         json={
-            "model": settings.llm_model,
+            "model": active_chat_model(),
             "messages": [
                 {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
                 {
@@ -283,11 +280,20 @@ def analyze_transcript_conversation(transcript: str | None, raw_timeline: str | 
 
 
 def summarize(transcript: str, period_label: str, selected_mode: str | None = None) -> tuple[str, str]:
-    mode = selected_mode or settings.default_summary_mode
-    fallback_order = [mode, "deepseek_v4_pro", "qwen_plus"]
+    """Summarize with the selected model, falling back to the other available ones.
+
+    The catalog comes from the provider, so a renamed model (for example
+    deepseek-v4-flash -> deepseek-flash) does not break summaries.
+    """
+    from models import fallback_modes, resolve, resolve_key
+
+    mode = resolve_key(selected_mode or settings.default_summary_mode) or ""
     errors: list[str] = []
-    for candidate in dict.fromkeys(fallback_order):
-        label, provider, model = SUMMARY_MODES.get(candidate, SUMMARY_MODES["deepseek_v4_flash"])
+    for candidate in dict.fromkeys([mode, *fallback_modes(mode)]):
+        resolved = resolve(candidate)
+        if resolved is None:
+            continue
+        label, provider, model = resolved
         try:
             if provider == "deepseek" and settings.llm_key:
                 return summarize_with_deepseek(transcript, period_label, model), label

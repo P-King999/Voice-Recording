@@ -9,6 +9,13 @@ from pathlib import Path
 
 from config import DB_PATH, ensure_storage
 
+# A recording "has content" when it produced a transcript or an analysis title.
+# This mirrors dashboard.is_empty_record() in SQL.
+CONTENT_SQL = """(COALESCE(transcript, '') <> '' OR (
+    json_valid(conversation_analysis)
+    AND COALESCE(json_extract(conversation_analysis, '$.title'), '') NOT IN ('', '空')
+))"""
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -86,9 +93,15 @@ def init_db() -> None:
             "excitement_rating": "INTEGER NOT NULL DEFAULT 1",
             "speaker_aliases": "TEXT NOT NULL DEFAULT '{}'",
             "feishu_record_id": "TEXT",
+            "source": "TEXT NOT NULL DEFAULT 'recorded'",
         }.items():
             if column not in columns:
                 conn.execute(f"ALTER TABLE segments ADD COLUMN {column} {definition}")
+        # Files copied by the import feature live under recordings/imported/.
+        conn.execute(
+            """UPDATE segments SET source = 'imported'
+               WHERE source = 'recorded' AND (path LIKE '%\\imported\\%' OR path LIKE '%/imported/%')"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_status_recorded ON segments(status, recorded_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_recorded ON segments(recorded_at)")
         conn.execute(
@@ -174,14 +187,28 @@ def init_db() -> None:
         )
 
 
-def add_segment(path: Path, recorded_at: datetime, duration_seconds: float, status: str = "queued") -> None:
+def add_segment(
+    path: Path,
+    recorded_at: datetime,
+    duration_seconds: float,
+    status: str = "queued",
+    source: str = "recorded",
+) -> None:
     timestamp = now()
     with transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO segments
-               (path, recorded_at, duration_seconds, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (str(path), recorded_at.astimezone(timezone.utc).isoformat(), duration_seconds, status, timestamp, timestamp),
+               (path, recorded_at, duration_seconds, status, source, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(path),
+                recorded_at.astimezone(timezone.utc).isoformat(),
+                duration_seconds,
+                status,
+                source,
+                timestamp,
+                timestamp,
+            ),
         )
 
 
@@ -297,7 +324,7 @@ def dashboard_overview(limit: int = 120) -> list[sqlite3.Row]:
     """Return only list-view fields; transcripts and analysis are loaded on demand."""
     with transaction() as conn:
         return conn.execute(
-            """SELECT id, path, recorded_at, duration_seconds, dbfs, active_seconds, status,
+            """SELECT id, path, recorded_at, duration_seconds, dbfs, active_seconds, status, source,
                       favorite, tags, notes,
                       CASE WHEN json_valid(conversation_analysis) THEN excitement_rating ELSE 0 END AS display_rating,
                       CASE WHEN json_valid(conversation_analysis)
@@ -309,10 +336,24 @@ def dashboard_overview(limit: int = 120) -> list[sqlite3.Row]:
 
 
 def dashboard_counts() -> dict[str, int]:
+    """Count what a reader cares about: recordings with content.
+
+    Silent fragments and failed transcriptions are reported separately so they
+    never inflate the headline numbers.
+    """
     with transaction() as conn:
         rows = conn.execute("SELECT status, COUNT(*) AS count FROM segments GROUP BY status").fetchall()
+        total = int(conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0])
+        content = int(conn.execute(f"SELECT COUNT(*) FROM segments WHERE {CONTENT_SQL}").fetchone()[0])
+        content_complete = int(
+            conn.execute(f"SELECT COUNT(*) FROM segments WHERE status = 'complete' AND {CONTENT_SQL}").fetchone()[0]
+        )
     counts = {str(row["status"]): int(row["count"]) for row in rows}
-    counts["all"] = sum(counts.values())
+    counts["all"] = total
+    counts["content"] = content
+    counts["content_complete"] = content_complete
+    counts["empty"] = total - content
+    counts["pending"] = sum(counts.get(name, 0) for name in ("queued", "transcribing", "awaiting_dashscope_config"))
     return counts
 
 
@@ -352,10 +393,17 @@ def find_dashboard_overview(
     newest_first: bool = True,
     limit: int = 100,
     offset: int = 0,
+    exclude_empty: bool = False,
+    sources: list[str] | None = None,
 ) -> tuple[list[sqlite3.Row], int]:
     """Filter the entire archive in SQLite while only returning list-view fields."""
     clauses: list[str] = []
     values: list[object] = []
+    if exclude_empty:
+        clauses.append(CONTENT_SQL)
+    if sources:
+        clauses.append(f"source IN ({','.join('?' for _ in sources)})")
+        values.extend(sources)
     if query.strip():
         needle = f"%{query.strip()}%"
         clauses.append("(transcript LIKE ? OR conversation_analysis LIKE ? OR notes LIKE ? OR tags LIKE ?)")
@@ -381,7 +429,7 @@ def find_dashboard_overview(
         clauses.append("favorite = 1")
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     direction = "DESC" if newest_first else "ASC"
-    columns = """id, path, recorded_at, duration_seconds, dbfs, active_seconds, status,
+    columns = """id, path, recorded_at, duration_seconds, dbfs, active_seconds, status, source,
                  favorite, tags, notes,
                  CASE WHEN json_valid(conversation_analysis) THEN excitement_rating ELSE 0 END AS display_rating,
                  CASE WHEN json_valid(conversation_analysis)

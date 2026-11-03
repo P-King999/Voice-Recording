@@ -2,6 +2,7 @@
 __pycache__/
 data/
 runtime/
+reports/
 build/
 dist/
 .env

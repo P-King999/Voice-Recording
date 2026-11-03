@@ -72,6 +72,29 @@ def dashboard_arguments(bind_address: str) -> tuple[str, ...]:
     )
 
 
+def service_environment(root: Path) -> dict[str, str]:
+    """Give each service the current .env values instead of the Agent's snapshot.
+
+    The Agent reads .env once at start-up; without this, editing a setting (for
+    example the microphone or report times) only took effect after a re-login.
+    """
+    env = dict(os.environ)
+    env_path = root / ".env"
+    if not env_path.exists():
+        return env
+    try:
+        content = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return env
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
 def configured_dashboard_bind_address(root: Path) -> str:
     """Read the current bind address so a dashboard-only restart uses saved settings."""
     env_path = root / ".env"
@@ -176,7 +199,7 @@ class VoiceRecorderAgent:
         )
         command = [sys.executable, *arguments]
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-        process = subprocess.Popen(command, cwd=self.root, creationflags=creation_flags)
+        process = subprocess.Popen(command, cwd=self.root, creationflags=creation_flags, env=service_environment(self.root))
         if self.job_handle is not None and os.name == "nt":
             import ctypes
 

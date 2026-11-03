@@ -166,17 +166,19 @@ class Settings:
     dashscope_asr_model: str = os.getenv("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash-filetrans")
     dashscope_delete_uploaded_file: bool = os.getenv("DASHSCOPE_DELETE_UPLOADED_FILE", "true").lower() == "true"
     dashscope_enable_diarization: bool = os.getenv("DASHSCOPE_ENABLE_DIARIZATION", "true").lower() == "true"
-    default_summary_mode: str = os.getenv("DEFAULT_SUMMARY_MODE", "deepseek_v4_flash").lower()
+    default_summary_mode: str = os.getenv("DEFAULT_SUMMARY_MODE", "deepseek_flash").lower()
     rating_template: str = os.getenv("RATING_TEMPLATE", "general").lower()
     rating_custom_prompt: str = os.getenv("RATING_CUSTOM_PROMPT", "")
     bailian_summary_model: str = os.getenv("BAILIAN_SUMMARY_MODEL", "qwen-plus")
     llm_url: str = os.getenv("LLM_API_URL", "https://api.deepseek.com/chat/completions").rstrip("/")
     llm_key: str = os.getenv("LLM_API_KEY", "")
-    llm_model: str = os.getenv("LLM_MODEL", "deepseek-chat")
+    llm_model: str = os.getenv("LLM_MODEL", "deepseek-flash")
     dashboard_password: str = os.getenv("DASHBOARD_PASSWORD", "")
     dashboard_bind_address: str = os.getenv("DASHBOARD_BIND_ADDRESS", "127.0.0.1").strip() or "127.0.0.1"
     dashboard_local_no_password: bool = os.getenv("DASHBOARD_LOCAL_NO_PASSWORD", "false").lower() == "true"
     disk_warning_gb: float = float(os.getenv("DISK_WARNING_GB", "10"))
+    recover_partial_days: int = env_int("RECOVER_PARTIAL_DAYS", 7)
+    empty_retention_days: int = env_int("EMPTY_RETENTION_DAYS", 30)
     report_enabled: bool = os.getenv("REPORT_ENABLED", "false").lower() == "true"
     report_times: tuple[str, ...] = tuple(
         value.strip() for value in os.getenv("REPORT_TIMES", "12:10,17:10,21:10").split(",") if value.strip()

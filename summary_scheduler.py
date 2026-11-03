@@ -123,6 +123,12 @@ def main() -> None:
             run_due_summaries()
         except Exception:
             logging.exception("Scheduled summary check failed")
+        try:
+            import maintenance
+
+            maintenance.run_scheduled_cleanup()
+        except Exception:
+            logging.exception("Scheduled empty-recording cleanup failed")
         time.sleep(max(20, settings.summary_scheduler_interval_seconds))
 
 

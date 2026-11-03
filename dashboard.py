@@ -28,6 +28,9 @@ from config import (
 )
 from exports import markdown as export_markdown, srt as export_srt, word_html
 from health import snapshot
+import maintenance
+import models as model_catalog
+import report_book as book
 from rating_templates import (
     delete_user_template,
     rating_instruction,
@@ -62,11 +65,6 @@ STATUS_LABELS = {
     "failed": "处理失败",
     "realtime_failed": "旧实时识别失败",
     "realtime_unavailable": "旧片段无法补发实时识别",
-}
-SUMMARY_MODE_LABELS = {
-    "deepseek_v4_flash": "DeepSeek-V4-Flash",
-    "deepseek_v4_pro": "DeepSeek-V4-Pro",
-    "qwen_plus": "千问 Qwen Plus",
 }
 RATING_LABELS = {
     0: "0星 无实质内容/未分析",
@@ -245,12 +243,21 @@ def search_records(
     favorites_only: bool,
     newest_first: bool = True,
     page: int = 0,
+    exclude_empty: bool = True,
+    sources: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, object]], int]:
     records, total = find_dashboard_overview(
         query, list(statuses), recorded_on, list(ratings), list(tags), favorites_only,
         newest_first, limit=100, offset=max(0, page) * 100,
+        exclude_empty=exclude_empty, sources=list(sources) or None,
     )
     return [dict(record) for record in records], total
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def purge_preview(days: int) -> tuple[int, float]:
+    plan = maintenance.plan_purge(days)
+    return plan.count, plan.megabytes
 
 
 def archive_groups(records: list[object], now: datetime) -> list[tuple[str, str, list[object]]]:
@@ -454,6 +461,17 @@ def render_conversation_analysis(record: object, widget_prefix: str = "") -> Non
                 else:
                     rendered_items.append(str(item))
             st.caption(f"待办：{'；'.join(rendered_items)}")
+
+
+def model_labels() -> dict[str, str]:
+    """Model choices come from the provider catalog, so renames need no code change."""
+    return model_catalog.summary_mode_labels()
+
+
+def model_index(labels: dict[str, str], wanted: str | None) -> int:
+    key = model_catalog.resolve_key(wanted or settings.default_summary_mode)
+    keys = list(labels)
+    return keys.index(key) if key in keys else 0
 
 
 def period_details(choice: str, now: datetime) -> tuple[str, datetime, datetime, str]:
@@ -679,7 +697,12 @@ def import_audio_sources(source: Path) -> tuple[int, list[str]]:
                 duration = 0.0
             destination = imported_dir / f"{audio_path.stem}-{uuid4().hex[:8]}{audio_path.suffix.lower()}"
             shutil.copy2(audio_path, destination)
-            add_segment(destination, datetime.fromtimestamp(audio_path.stat().st_mtime).astimezone(), duration)
+            add_segment(
+                destination,
+                datetime.fromtimestamp(audio_path.stat().st_mtime).astimezone(),
+                duration,
+                source="imported",
+            )
             imported += 1
         except (OSError, RuntimeError) as exc:
             errors.append(f"{audio_path.name}: {exc}")
@@ -769,18 +792,41 @@ def render_record_detail(record: dict[str, object], widget_prefix: str) -> None:
                 st.info("该片段尚未完成转写。")
 
 
+def record_title_or_reason(record: dict[str, object]) -> str:
+    """A readable label for records that have no analysis title."""
+    status = str(record.get("status"))
+    if status == "silent":
+        return "静音片段（没有检测到人声）"
+    if status == "failed":
+        return "转写失败（没有逐字稿）"
+    if status == "awaiting_dashscope_config":
+        return "等待转写配置"
+    return "没有内容的录音"
+
+
+def source_badge(record: dict[str, object]) -> str:
+    """A compact marker so imported files are recognisable at a glance."""
+    return " · 导入" if str(record.get("source") or "recorded") == "imported" else ""
+
+
 def overview_title(record: dict[str, object]) -> str:
     """Prefer the analysis title without loading full analysis JSON for the home list."""
     title = str(record.get("display_title") or "").strip()
     if not title:
         analysis = parse_conversation_analysis(str(record.get("conversation_analysis") or ""))
         title = text_value(analysis.get("title"), "") if analysis else ""
-    return title if title else "空"
+    if title and title != "空":
+        return title
+    return record_title_or_reason(record)
 
 
 def is_empty_record(record: dict[str, object]) -> bool:
-    """Keep recordings without a meaningful analysis title out of the default list."""
-    return overview_title(record) == "空"
+    """True when the recording has no analysis title, i.e. nothing to read."""
+    title = str(record.get("display_title") or "").strip()
+    if not title:
+        analysis = parse_conversation_analysis(str(record.get("conversation_analysis") or ""))
+        title = text_value(analysis.get("title"), "") if analysis else ""
+    return not title or title == "空"
 
 
 def display_rating(record: dict[str, object]) -> int:
@@ -864,35 +910,107 @@ with home_tab:
         render_live_recording()
     counts = dashboard_counts()
     metrics = st.columns(4)
-    metrics[0].metric("全部片段", counts.get("all", 0))
-    metrics[1].metric("已完成", counts.get("complete", 0))
-    metrics[2].metric("等待处理", counts.get("queued", 0) + counts.get("awaiting_dashscope_config", 0))
-    metrics[3].metric("处理失败", counts.get("failed", 0))
+    metrics[0].metric("有效录音", counts.get("content", 0), help="有逐字稿或分析标题的录音；静音和转写失败不计入")
+    metrics[1].metric("已完成", counts.get("content_complete", 0))
+    metrics[2].metric("等待处理", counts.get("pending", 0))
+    metrics[3].metric("无内容", counts.get("empty", 0), help="静音或转写失败的片段，不计入统计，达到保留期限后自动清理")
+    if counts.get("empty"):
+        st.caption(
+            f"另有 {counts['empty']} 条无内容录音（静音 / 转写失败）已从统计和列表隐藏，"
+            f"{settings.empty_retention_days} 天后自动删除。"
+        )
     st.subheader("时段汇总")
     now = datetime.now().astimezone()
     choice = st.segmented_control("汇总范围", ["本日", "本日上午", "本日下午", "本日晚上", "本周", "本月"], default="本日", key="home-summary-period")
     period_type, period_start, period_end, period_label = period_details(choice or "本日", now)
+    period_stats = book.range_stats(period_start, min(period_end, now))
+
+    cards = st.columns(4)
+    cards[0].metric("录音分段", f"{period_stats.segments} 个")
+    cards[1].metric("录音时长", book.hours_text(period_stats.recorded))
+    cards[2].metric("检测到说话", book.hours_text(period_stats.active))
+    cards[3].metric("可分析逐字稿", f"{period_stats.transcribed} 段")
+    if period_end <= period_start:
+        st.caption(f"{period_label} 还没有开始。")
+    else:
+        st.caption(
+            f"{period_label} · 统计范围 {period_start:%m-%d %H:%M} – {min(period_end, now):%m-%d %H:%M}"
+        )
+
     summary = get_period_summary(period_type, period_start)
-    summary_left, summary_right = st.columns([5, 1])
-    with summary_left:
-        if summary:
-            st.markdown(summary["summary"])
-            st.caption(f"{period_label} · {summary['provider']} · 基于 {summary['source_segment_count']} 段逐字稿")
-        else:
-            st.caption(f"{period_label} 尚未生成汇总。")
-    with summary_right:
-        selected_mode = st.selectbox("模型", list(SUMMARY_MODE_LABELS), format_func=lambda value: SUMMARY_MODE_LABELS[value], key="home-summary-model")
-        if st.button("生成汇总", key="home-generate-summary"):
-            with st.spinner("正在读取该时段逐字稿并生成汇总..."):
-                transcript, source_count = period_transcript(period_start, period_end)
-                if not transcript:
-                    st.warning("该时段没有可用逐字稿。")
+    summary_text = str(summary["summary"]).strip() if summary and summary["summary"] else ""
+    summary_col, detail_col = st.columns([3, 2])
+    with summary_col:
+        with st.container(border=True):
+            st.markdown(f"**{period_label}摘要**")
+            if summary_text and summary_text not in {"空", "无"}:
+                st.markdown(summary_text)
+                st.caption(f"{summary['provider']} · 基于 {summary['source_segment_count']} 段逐字稿")
+            else:
+                st.caption("尚未生成摘要。有逐字稿后点下面的“生成汇总”即可。")
+            controls = st.columns([2, 1, 1])
+            labels = model_labels()
+            if st.session_state.get("home-summary-model") not in labels:
+                st.session_state["home-summary-model"] = next(iter(labels), "qwen_plus")
+            selected_mode = controls[0].selectbox(
+                "模型", list(labels), format_func=lambda value: labels.get(value, value), key="home-summary-model"
+            )
+            if controls[1].button("生成汇总", key="home-generate-summary"):
+                with st.spinner("正在读取该时段逐字稿并生成汇总..."):
+                    transcript, source_count = period_transcript(period_start, period_end)
+                    if not transcript:
+                        st.warning("该时段没有可用逐字稿。")
+                    else:
+                        from worker import generate_period_summary
+                        generate_period_summary(period_type, period_start, period_end, period_label, selected_mode)
+                        st.success(f"已基于 {source_count} 段逐字稿生成汇总。")
+                        st.rerun()
+            if controls[2].button("↻ 模型", key="home-refresh-models", help="从 DeepSeek 读取最新模型列表"):
+                try:
+                    model_catalog.refresh(force=True)
+                except Exception as exc:
+                    st.warning(f"刷新失败：{exc}")
+                st.rerun()
+    with detail_col:
+        with st.container(border=True):
+            if period_type in {"day", "morning", "afternoon", "evening"}:
+                st.markdown("**时段分布**")
+                day_card = book.day_stats(now.date(), now)
+                st.dataframe(
+                    [
+                        {"时段": f"{label} {span}", "分段": count, "录音": book.hours_text(recorded), "说话": book.hours_text(active)}
+                        for label, span, count, recorded, active in day_card.spans
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.markdown("**每日明细**")
+                if period_stats.by_day:
+                    st.dataframe(
+                        [
+                            {
+                                "日期": f"{day:%m-%d}",
+                                "分段": segments,
+                                "录音": book.hours_text(recorded),
+                                "说话": book.hours_text(active),
+                                "逐字稿": f"{transcribed} 段",
+                            }
+                            for day, segments, recorded, active, transcribed in reversed(period_stats.by_day)
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                        height=260,
+                    )
                 else:
-                    from worker import generate_period_summary
-                    generate_period_summary(period_type, period_start, period_end, period_label, selected_mode)
-                    st.success(f"已基于 {source_count} 段逐字稿生成汇总。")
-                    st.rerun()
+                    st.caption("这个时段还没有录音。")
     st.subheader("本日和最近录音")
+    show_home_empty = st.toggle(
+        "显示无内容录音",
+        key="home_show_empty",
+        value=False,
+        help="静音和转写失败的片段默认不显示，也不计入统计。",
+    )
     recent = load_dashboard_records()
     if recent:
         today_records = [item for item in recent if record_recorded_at(item).date() == now.date()]
@@ -911,26 +1029,41 @@ with home_tab:
                     status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
                     title, favorite_action, button = st.columns([4, 1, 1])
                     title.write(overview_title(item))
-                    title.caption(f"{rating_label(item)} · {record_recorded_at(item):%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
+                    title.caption(f"{rating_label(item)}{source_badge(item)} · {record_recorded_at(item):%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
                     if favorite_action.button("★" if item["favorite"] else "☆", key=f"{prefix}-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
                         toggle_favorite(int(item["id"]), item["favorite"])
                         st.rerun()
                     if button.button("查看", key=f"{prefix}-{item['id']}"):
                         st.session_state["home_record_id"] = int(item["id"])
                         st.rerun()
-                if empty_items:
-                    with st.expander(f"空（{len(empty_items)} 条）", expanded=False):
-                        for item in empty_items:
-                            status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
-                            title, favorite_action, button = st.columns([4, 1, 1])
-                            title.write(overview_title(item))
-                            title.caption(f"{rating_label(item)} · {record_recorded_at(item):%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
-                            if favorite_action.button("★" if item["favorite"] else "☆", key=f"{prefix}-empty-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
-                                toggle_favorite(int(item["id"]), item["favorite"])
-                                st.rerun()
-                            if button.button("查看", key=f"{prefix}-empty-{item['id']}"):
-                                st.session_state["home_record_id"] = int(item["id"])
-                                st.rerun()
+                if empty_items and show_home_empty:
+                    silent = sum(1 for item in empty_items if str(item["status"]) == "silent")
+                    failed = sum(1 for item in empty_items if str(item["status"]) == "failed")
+                    parts = []
+                    if silent:
+                        parts.append(f"静音 {silent}")
+                    if failed:
+                        parts.append(f"失败 {failed}")
+                    label = f"无内容录音 {len(empty_items)} 条（{'、'.join(parts) or '未分析'}）"
+                    with st.expander(label, expanded=False):
+                        st.caption(
+                            "这些片段没有检测到人声，所以没有逐字稿，也就没有标题。"
+                            "常见原因是麦克风被虚拟声卡占用或设备静音；它们不会影响上面的汇总。"
+                        )
+                        st.dataframe(
+                            [
+                                {
+                                    "时间": f"{record_recorded_at(item):%m-%d %H:%M}",
+                                    "时长": f"{item['duration_seconds'] / 60:.1f} 分钟",
+                                    "状态": STATUS_LABELS.get(str(item["status"]), str(item["status"])),
+                                }
+                                for item in empty_items[:50]
+                            ],
+                            hide_index=True,
+                            width="stretch",
+                        )
+                        if len(empty_items) > 50:
+                            st.caption(f"仅列出最近 50 条，共 {len(empty_items)} 条。")
         if "home_record_id" not in st.session_state:
             st.session_state["home_record_id"] = int((today_records or recent)[0]["id"])
         home_record_id = st.session_state.get("home_record_id")
@@ -1017,6 +1150,10 @@ with archive_tab:
         bool(st.session_state.get("archive_favorites_only", False)),
         bool(st.session_state["archive_newest_first"]),
         page,
+        not bool(st.session_state.get("archive_show_empty", False)),
+        {"全部": (), "录音": ("recorded",), "导入": ("imported",)}.get(
+            st.session_state.get("archive_source", "全部"), ()
+        ),
     )
     page_size = 100
     page_count = max(1, (total_results + page_size - 1) // page_size)
@@ -1061,8 +1198,49 @@ with archive_tab:
         archive_list_scroll.caption(f"当前已定位至 {st.session_state['archive_date']:%Y年%m月%d日}。")
 
     if results:
+        source_filter = (
+            archive_list_scroll.segmented_control(
+                "来源",
+                ["全部", "录音", "导入"],
+                default="全部",
+                key="archive_source",
+                help="“导入”是本机导入的音频文件，“录音”是后台麦克风录制的片段。",
+            )
+            or "全部"
+        )
+        show_empty = archive_list_scroll.toggle(
+            "显示无内容录音（静音 / 转写失败）",
+            key="archive_show_empty",
+            value=False,
+            help="默认隐藏没有逐字稿的片段，避免把列表刷满；打开后可查看每一条。",
+        )
         visible_results = [item for item in results if not is_empty_record(item)]
         empty_results = [item for item in results if is_empty_record(item)]
+        if not show_empty:
+            archive_list_scroll.caption(
+                f"已隐藏无内容录音（静音 / 转写失败），它们不计入统计，{settings.empty_retention_days} 天后自动删除。"
+            )
+        with archive_list_scroll.expander("清理无内容录音", expanded=False):
+            keep_days = st.number_input(
+                "保留最近多少天",
+                min_value=1,
+                max_value=365,
+                value=int(settings.empty_retention_days),
+                step=1,
+                key="purge-keep-days",
+            )
+            purge_count, purge_mb = purge_preview(int(keep_days))
+            st.caption(
+                f"当前可清理 {purge_count} 条，约 {purge_mb:.0f} MB。"
+                "只删除没有逐字稿、也没有分析标题的录音；有新内容的一律保留。"
+            )
+            purge_confirmed = st.checkbox("我确认删除这些音频文件", key="purge-confirm")
+            if st.button("立即清理", key="purge-now", disabled=not purge_confirmed or purge_count == 0):
+                purged = maintenance.purge_empty_segments(int(keep_days))
+                purge_preview.clear()
+                st.success(f"已清理 {purged.count} 条，释放约 {purged.megabytes:.0f} MB。")
+                clear_record_caches()
+                st.rerun()
         visible_recording_date = None
         for item in visible_results:
             recording_at = record_recorded_at(item)
@@ -1074,26 +1252,34 @@ with archive_tab:
             status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
             title, timestamp, favorite_action, action = archive_list_scroll.columns([5, 3, 1, 1])
             title.write(overview_title(item))
-            timestamp.caption(f"{rating_label(item)} · {record_recorded_at(item):%Y-%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
+            timestamp.caption(f"{rating_label(item)}{source_badge(item)} · {record_recorded_at(item):%Y-%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
             if favorite_action.button("★" if item["favorite"] else "☆", key=f"archive-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
                 toggle_favorite(int(item["id"]), item["favorite"])
                 st.rerun()
             if action.button("查看", key=f"archive-view-{item['id']}"):
                 st.session_state["archive_record_id"] = int(item["id"])
                 st.rerun()
-        if empty_results:
-            with archive_list_scroll.expander(f"空（{len(empty_results)} 条）", expanded=False):
+        if empty_results and show_empty:
+            with archive_list_scroll.expander(f"无内容录音（{len(empty_results)} 条）", expanded=False):
                 for item in empty_results:
                     status = STATUS_LABELS.get(str(item["status"]), str(item["status"]))
                     title, timestamp, favorite_action, action = st.columns([5, 3, 1, 1])
                     title.write(overview_title(item))
-                    timestamp.caption(f"{rating_label(item)} · {record_recorded_at(item):%Y-%m-%d %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
+                    timestamp.caption(f"{rating_label(item)}{source_badge(item)} · {record_recorded_at(item):%Y年%m月%d日 %H:%M} · {item['duration_seconds'] / 60:.1f} 分钟 · {status}")
                     if favorite_action.button("★" if item["favorite"] else "☆", key=f"archive-empty-favorite-{item['id']}", help="取消收藏" if item["favorite"] else "收藏"):
                         toggle_favorite(int(item["id"]), item["favorite"])
                         st.rerun()
                     if action.button("查看", key=f"archive-empty-view-{item['id']}"):
                         st.session_state["archive_record_id"] = int(item["id"])
                         st.rerun()
+        elif empty_results:
+            silent = sum(1 for item in empty_results if str(item["status"]) == "silent")
+            failed = sum(1 for item in empty_results if str(item["status"]) == "failed")
+            parts = [f"静音 {silent}" if silent else "", f"失败 {failed}" if failed else ""]
+            archive_list_scroll.caption(
+                f"已隐藏 {len(empty_results)} 条无内容录音（{'、'.join(part for part in parts if part) or '未分析'}）。"
+                "需要查看时打开上方的“显示无内容录音”。"
+            )
         pager_left, pager_center, pager_right = archive_list_scroll.columns([1, 4, 1])
         if pager_left.button("上一页", disabled=page == 0):
             st.session_state["archive_page"] = page - 1
@@ -1122,10 +1308,11 @@ with archive_tab:
         if actions[1].button("删除选中项", disabled=not selected_records):
             st.session_state["confirm_delete"] = True
         if st.session_state.get("confirm_delete") and selected_records:
-            if st.checkbox("确认永久删除选中的录音和记录"):
-                paths = delete_segments([int(item["id"]) for item in selected_records])
-                for path in paths:
-                    Path(path).unlink(missing_ok=True)
+            if st.checkbox("确认把选中的录音移到回收站"):
+                import recycle
+
+                recycle.recycle_paths([Path(str(item["path"])) for item in selected_records])
+                delete_segments([int(item["id"]) for item in selected_records])
                 st.session_state["confirm_delete"] = False
                 clear_record_caches()
                 st.rerun()
@@ -1262,7 +1449,14 @@ with settings_tab:
         recording_directory = recording_section.text_input("录音默认保存目录", value=str(RECORDINGS_DIR), help="新录音与导入的副本会保存在此处。留空时默认为项目 data/recordings。")
         dashboard_section = st.expander("看板与汇总", expanded=False)
         model_cols = dashboard_section.columns(2)
-        summary_mode = model_cols[0].selectbox("默认汇总模型", list(SUMMARY_MODE_LABELS), index=list(SUMMARY_MODE_LABELS).index(env_value("DEFAULT_SUMMARY_MODE") or settings.default_summary_mode), format_func=lambda value: SUMMARY_MODE_LABELS[value])
+        summary_mode_labels = model_labels()
+        summary_mode = model_cols[0].selectbox(
+            "默认汇总模型",
+            list(summary_mode_labels),
+            index=model_index(summary_mode_labels, env_value("DEFAULT_SUMMARY_MODE")),
+            format_func=lambda value: summary_mode_labels.get(value, value),
+            help="列表每 12 小时自动从 DeepSeek 读取一次；也可以在首页模型旁点“↻ 模型”立即刷新。",
+        )
         dashboard_password = model_cols[1].text_input("看板访问密码", value=env_value("DASHBOARD_PASSWORD"), type="default" if reveal_secrets else "password", help="修改后，新的浏览器会话需使用新密码登录。")
         dashboard_bind_address = (env_value("DASHBOARD_BIND_ADDRESS") or settings.dashboard_bind_address).strip()
         lan_access_enabled = dashboard_section.toggle(
